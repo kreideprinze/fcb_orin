@@ -61,11 +61,26 @@ if command -v gst-inspect-1.0 >/dev/null 2>&1; then
     if gst-inspect-1.0 nvv4l2h264enc >/dev/null 2>&1; then
         ok "nvv4l2h264enc (Jetson hardware H.264 encoder)"
     else
-        warn "gstreamer is present but nvv4l2h264enc is not -- not a Jetson,
-        or the L4T multimedia plugins are missing. CPU encoding will be used."
+        # nvidia-l4t-multimedia is not the one that ships the GStreamer
+        # elements -- nvidia-l4t-gstreamer is, and JetPack does not always
+        # pull it in. Without it there is no nvv4l2h264enc and no nvvidconv,
+        # which is the whole NVENC pipeline.
+        hint="CPU encoding will be used, which drops frames at 1080p60."
+        # Captured rather than piped into grep: with pipefail set, grep -q
+        # closes the pipe on its first match, the producer dies of SIGPIPE,
+        # and the pipeline reports failure even though the pattern matched.
+        policy="$(apt-cache policy nvidia-l4t-gstreamer 2>/dev/null || true)"
+        if [[ "$policy" == *"Installed: (none)"* ]]; then
+            hint="install it with:
+          sudo apt install nvidia-l4t-gstreamer
+        then re-run this check."
+        fi
+        warn "nvv4l2h264enc is missing -- the Jetson GStreamer plugins are not
+        installed. $hint"
     fi
 else
-    warn "gst-inspect-1.0 not found; cannot confirm the hardware encoder"
+    warn "gst-inspect-1.0 not found; cannot confirm the hardware encoder.
+        sudo apt install gstreamer1.0-tools"
 fi
 
 # -- tools and permissions --------------------------------------------
@@ -79,21 +94,31 @@ command -v tmux >/dev/null 2>&1 \
     && ok "tmux $(tmux -V | awk '{print $2}')" \
     || bad "tmux missing -- sudo apt install tmux"
 
-if id -nG "$USER" | grep -qw dialout; then
-    ok "user '$USER' is in the dialout group (serial access)"
+if [[ $EUID -eq 0 ]]; then
+    # Group membership is irrelevant to root, so checking it would only
+    # produce a scary and useless "add root to dialout" instruction.
+    ok "running as root -- device permissions are bypassed"
+    warn "running as root is not what you want here: recordings would be
+        written to $HOME and owned by root, and the tmux session would
+        belong to root rather than to you. Run it as your normal user."
 else
-    bad "user '$USER' is NOT in the dialout group, so /dev/ttyACM* will be
+    groups_of_user="$(id -nG "$USER" 2>/dev/null || true)"
+    if [[ " $groups_of_user " == *" dialout "* ]]; then
+        ok "user '$USER' is in the dialout group (serial access)"
+    else
+        bad "user '$USER' is NOT in the dialout group, so /dev/ttyACM* will be
         permission-denied. Fix with:
           sudo usermod -aG dialout $USER
         then log out and back in (a new SSH session is not enough if the
         session predates the change)."
-fi
+    fi
 
-if id -nG "$USER" | grep -qw video; then
-    ok "user '$USER' is in the video group (camera access)"
-else
-    warn "user '$USER' is not in the video group; /dev/video* may be
+    if [[ " $groups_of_user " == *" video "* ]]; then
+        ok "user '$USER' is in the video group (camera access)"
+    else
+        warn "user '$USER' is not in the video group; /dev/video* may be
         permission-denied. sudo usermod -aG video $USER"
+    fi
 fi
 
 # -- devices present ---------------------------------------------------
@@ -112,7 +137,8 @@ shopt -u nullglob
     || bad "no /dev/video* at all -- the camera is not attached"
 
 if command -v v4l2-ctl >/dev/null 2>&1; then
-    if v4l2-ctl --list-devices 2>/dev/null | grep -qiE 'neohd|fcb|harrier'; then
+    cameras="$(v4l2-ctl --list-devices 2>/dev/null || true)"
+    if grep -qiE 'neohd|fcb|harrier' <<<"$cameras"; then
         ok "an FCB/NeoHD camera is attached"
     else
         warn "no camera matching neohd/fcb/harrier is attached; the recorder
@@ -125,11 +151,23 @@ RECORD_DIR="${FCB_RECORD_DIR:-$HOME/fcb_recordings}"
 mkdir -p "$RECORD_DIR" 2>/dev/null
 if [[ -w "$RECORD_DIR" ]]; then
     free_gb=$(df -BG --output=avail "$RECORD_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')
-    if [[ -n "$free_gb" && "$free_gb" -lt 5 ]]; then
-        # 1080p60 H.264 at the default 25 Mbps is roughly 11 GB an hour.
-        warn "only ${free_gb} GB free in $RECORD_DIR (~11 GB per hour at 25 Mbps)"
+    # 1080p60 H.264 at the default 25 Mbps is about 11 GB an hour, so free
+    # space is only meaningful as flight time. Reporting "12 GB free" as
+    # fine would be misleading when that is barely one sortie.
+    # Never blocking, however little is left: a short recording beats no
+    # recording, and how much flight time is worth having is the operator's
+    # call, not this script's. Reported as time rather than gigabytes so
+    # the number means something at a glance.
+    if [[ -n "$free_gb" ]]; then
+        hours=$(awk "BEGIN{printf \"%.1f\", $free_gb/11}")
+        if [[ "$free_gb" -lt 25 ]]; then
+            warn "$RECORD_DIR has ${free_gb} GB free -- about ${hours} h of
+        recording at 25 Mbps."
+        else
+            ok "$RECORD_DIR is writable (${free_gb} GB free, ~${hours} h at 25 Mbps)"
+        fi
     else
-        ok "$RECORD_DIR is writable (${free_gb:-?} GB free)"
+        ok "$RECORD_DIR is writable"
     fi
 else
     bad "$RECORD_DIR is not writable"

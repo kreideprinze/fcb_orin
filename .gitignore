@@ -7,6 +7,8 @@ __pycache__/
 
 # Recordings and logs stay on the drone -- an hour of 1080p60 is ~11 GB
 fcb_recordings/
+snaps/
 *.mp4
 *.csv
 *.log
+*.jpg

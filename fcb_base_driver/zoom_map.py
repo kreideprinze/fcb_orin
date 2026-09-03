@@ -100,6 +100,81 @@ def position_to_unit(position: int, curve: str = "log") -> float:
     raise ValueError(f"unknown zoom curve {curve!r}, expected one of {CURVES}")
 
 
+#: Magnification step for a detented zoom knob. 0.5x divides 1x-30x into
+#: 59 detents, which is fine enough to frame a target and coarse enough
+#: that the same knob position gives the same shot twice.
+DEFAULT_RATIO_STEP = 0.5
+
+
+def snap_ratio(ratio: float, step: float) -> float:
+    """Round magnification to the nearest multiple of `step`, within range.
+
+    The grid is anchored at MIN_RATIO (1x), so a 0.5 step gives 1.0, 1.5,
+    2.0 ... 30.0 -- round numbers, which is the point of asking for it.
+    """
+    if not step or step <= 0:
+        return max(MIN_RATIO, min(MAX_RATIO, float(ratio)))
+    ratio = max(MIN_RATIO, min(MAX_RATIO, float(ratio)))
+    snapped = MIN_RATIO + round((ratio - MIN_RATIO) / step) * step
+    return max(MIN_RATIO, min(MAX_RATIO, snapped))
+
+
+def ratio_steps(step: float = DEFAULT_RATIO_STEP):
+    """Every detent a given step size produces across 1x-30x."""
+    if not step or step <= 0:
+        return []
+    out, ratio = [], MIN_RATIO
+    while ratio <= MAX_RATIO + 1e-9:
+        out.append(round(ratio, 6))
+        ratio += step
+    return out
+
+
+class RatioQuantizer:
+    """Turns a continuously variable zoom request into detents.
+
+    Snapping alone is not enough. A knob parked on a boundary sits at, say,
+    2.2499x one sample and 2.2501x the next, and plain rounding would flip
+    the target between 2.0x and 2.5x for the rest of the flight -- the lens
+    hunting back and forth, audibly, on video. So a detent is only left
+    once the request is `hysteresis` of a step *past* the halfway point,
+    which is what makes a physical detent feel sticky.
+
+    Stateful, and deliberately so: the current detent is part of the
+    answer. One instance per commander.
+    """
+
+    def __init__(self, step=DEFAULT_RATIO_STEP, hysteresis=0.15):
+        self.step = float(step or 0.0)
+        self.hysteresis = float(hysteresis)
+        self.current = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.step > 0
+
+    def reset(self, ratio=None):
+        """Adopt a detent without moving through the ones in between.
+
+        Used when something other than the knob has just placed the lens,
+        so the next knob sample is judged against where the lens actually
+        is rather than against a detent chosen a while ago.
+        """
+        self.current = None if ratio is None else snap_ratio(ratio, self.step)
+        return self.current
+
+    def snap(self, ratio: float) -> float:
+        if not self.enabled:
+            self.current = max(MIN_RATIO, min(MAX_RATIO, float(ratio)))
+            return self.current
+        ratio = max(MIN_RATIO, min(MAX_RATIO, float(ratio)))
+        if self.current is None:
+            self.current = snap_ratio(ratio, self.step)
+        elif abs(ratio - self.current) >= self.step * (0.5 + self.hysteresis):
+            self.current = snap_ratio(ratio, self.step)
+        return self.current
+
+
 def pwm_to_unit(pwm: int, pwm_min: int = 1000, pwm_max: int = 2000,
                 reverse: bool = False) -> float:
     """Normalize an RC channel's PWM microseconds to 0.0-1.0.

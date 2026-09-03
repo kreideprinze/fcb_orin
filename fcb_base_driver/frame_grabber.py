@@ -107,10 +107,17 @@ class FrameGrabber:
                 return None, after_seq, None
         return self.latest_meta()
 
+    #: Frames needed before a measured rate means anything. Two samples an
+    #: instant apart imply hundreds of fps, and that figure is not merely
+    #: cosmetic -- a recording started in the first moments would stamp it
+    #: into the video container and play back at the wrong speed.
+    MIN_SAMPLES_FOR_FPS = 5
+
     def fps(self):
+        """Measured capture rate, or 0.0 until there is enough to measure."""
         with self._lock:
             times = list(self._times)
-        if len(times) < 2:
+        if len(times) < self.MIN_SAMPLES_FOR_FPS:
             return 0.0
         span = times[-1] - times[0]
         return (len(times) - 1) / span if span > 0 else 0.0

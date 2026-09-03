@@ -24,6 +24,7 @@ echo "copying to $TARGET:$REMOTE_DIR ..."
 if command -v rsync >/dev/null 2>&1; then
     rsync -av --delete \
         --exclude '__pycache__' --exclude '*.pyc' \
+        --exclude '.git' --exclude '.pytest_cache' \
         "$HERE/" "$TARGET:$REMOTE_DIR/"
 else
     # rsync is not always on a fresh JetPack image; scp still gets it there.

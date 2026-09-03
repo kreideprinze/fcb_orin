@@ -72,6 +72,30 @@ done
 
 command -v tmux >/dev/null 2>&1 || die "tmux is not installed. sudo apt install tmux"
 
+if [[ $EUID -eq 0 && "${FCB_ALLOW_ROOT:-0}" != "1" ]]; then
+    # Refusing rather than warning, because under sudo everything still
+    # appears to work while quietly going to the wrong place, and that is
+    # only discovered after a flight when the footage is not where it
+    # should be.
+    cat >&2 <<MSG
+error: do not run this with sudo.
+
+  Recordings would be written to $HOME/fcb_recordings and owned by root,
+  the tmux session would belong to root so your own --status and --stop
+  would not find it, and the camera and flight controller do not need
+  root anyway -- membership of the dialout and video groups covers them.
+
+  Run it as your normal user:
+      ./start_recorder.sh
+
+  If a device really is permission-denied, fix the groups instead:
+      sudo usermod -aG dialout,video \$USER    # then log out and back in
+
+  To override anyway: FCB_ALLOW_ROOT=1 $0
+MSG
+    exit 1
+fi
+
 case "$ACTION" in
 status)
     if running; then
@@ -118,9 +142,20 @@ esac
 [[ -f "$RECORDER" ]] || die "fcb_record.py not found next to this script ($RECORDER)"
 
 if running; then
-    echo "session '$SESSION' is already running -- attaching"
-    [[ $DETACHED -eq 1 ]] || attach
-    exit 0
+    if recorder_alive; then
+        echo "session '$SESSION' is already running -- attaching"
+        [[ $DETACHED -eq 1 ]] || attach
+        exit 0
+    fi
+    # The session outlived the recorder: the pane is kept open on exit so
+    # its last output can be read. Attaching to that would look like a
+    # running recorder while nothing is recording, so it is cleared away
+    # and started afresh.
+    echo "session '$SESSION' exists but the recorder is dead -- its last output:"
+    tmux capture-pane -p -t "$SESSION" 2>/dev/null | grep -v '^$' | tail -5 \
+        | sed 's/^/    /'
+    echo "restarting it"
+    tmux kill-session -t "$SESSION" 2>/dev/null
 fi
 
 "$HERE/check_deps.sh" || die "dependency check failed; fix the above first"
@@ -153,6 +188,11 @@ tmux new-session -d -s "$SESSION" -n recorder \
 # Keep the pane alive if the shell inside ever exits, so a crash leaves its
 # last words on screen instead of a vanished session.
 tmux set-option -t "$SESSION" remain-on-exit on >/dev/null 2>&1
+
+# Cosmetics, and optional: a session started here should look the same as
+# one started through fly.sh, but a missing or failing style script must
+# never stop the recorder coming up.
+[[ -x "$HERE/gcs_style.sh" ]] && "$HERE/gcs_style.sh" "$SESSION" "$HERE" >/dev/null 2>&1
 
 echo "started tmux session '$SESSION'"
 if [[ $DETACHED -eq 1 ]]; then

@@ -24,6 +24,7 @@ MODULES=(
     frame_grabber.py
     mavlink_source.py
     rc_source.py
+    rc_switch.py
     zoom_servo.py
 )
 
