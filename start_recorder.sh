@@ -80,7 +80,7 @@ if [[ $EUID -eq 0 && "${FCB_ALLOW_ROOT:-0}" != "1" ]]; then
     cat >&2 <<MSG
 error: do not run this with sudo.
 
-  Recordings would be written to $HOME/fcb_recordings and owned by root,
+  Recordings would be written to ${FCB_RECORD_DIR:-$HOME/flight_recordings} and owned by root,
   the tmux session would belong to root so your own --status and --stop
   would not find it, and the camera and flight controller do not need
   root anyway -- membership of the dialout and video groups covers them.

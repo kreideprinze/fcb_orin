@@ -23,6 +23,7 @@ import os
 import shutil
 from datetime import datetime
 
+import prefer_cv2  # noqa: F401  -- before cv2
 import cv2
 
 #: One cell is two stacked pixels: foreground paints the top half,

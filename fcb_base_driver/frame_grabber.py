@@ -25,10 +25,36 @@ import time
 import cv2
 
 
+def _same_frame(a, b):
+    """Whether two frames are byte-identical, judged on a sparse grid.
+
+    One pixel in 16 each way is ~0.4% of the frame -- cheap at 80 fps, and
+    still thousands of samples, so a real frame's noise always shows.
+    """
+    return (b is not None and a.shape == b.shape
+            and (a[::16, ::16] == b[::16, ::16]).all())
+
+
 class FrameGrabber:
 
-    def __init__(self, capture):
+    def __init__(self, capture, yuv_code=cv2.COLOR_YUV2BGR_YUYV,
+                 drop_repeats=False):
+        """`yuv_code` decodes raw two-channel frames; it must match the
+        packing the camera negotiated (devices.yuv422_to_bgr_code), since
+        YUYV and UYVY frames have the same shape.
+
+        `drop_repeats` discards a frame identical to the one before it. The
+        Oppila board sends every third camera frame twice -- 78.7 frames a
+        second carrying the camera's ~59 -- and passing the copies on would
+        both stutter the video and inflate the measured rate it is tagged
+        with. Two real frames are never identical, even of a still scene:
+        sensor noise alone differed by ~0.67 grey levels on average.
+        """
         self._capture = capture
+        self._yuv_code = yuv_code
+        self._drop_repeats = drop_repeats
+        self._dropped_last = False
+        self.repeats_dropped = 0
         self._raw = None
         self._seq = 0
         self._captured_at = None
@@ -49,6 +75,18 @@ class FrameGrabber:
             if not ok:
                 time.sleep(0.05)
                 continue
+            # At most one in a row. The board repeats a single frame, never
+            # two; a run of identical frames is the picture itself -- a blank
+            # one when the board gets no image from the camera -- and
+            # dropping it all made a live, blank camera look like no camera:
+            # the recorder saw no frames, reopened the device every 5 s, and
+            # that churn wedged the board.
+            if (self._drop_repeats and not self._dropped_last
+                    and _same_frame(frame, self._raw)):
+                self._dropped_last = True
+                self.repeats_dropped += 1
+                continue
+            self._dropped_last = False
             now = time.monotonic()
             with self._new_frame:
                 self._raw = frame
@@ -84,9 +122,9 @@ class FrameGrabber:
         if raw is None:
             return None, seq, stamp
         # Two channels per pixel means CAP_PROP_CONVERT_RGB stuck and these
-        # are raw YUYV bytes; anything else is already converted.
+        # are raw 4:2:2 bytes; anything else is already converted.
         if raw.ndim == 3 and raw.shape[2] == 2:
-            frame = cv2.cvtColor(raw, cv2.COLOR_YUV2BGR_YUYV)
+            frame = cv2.cvtColor(raw, self._yuv_code)
         else:
             frame = raw
         with self._lock:

@@ -7,12 +7,16 @@
 #   ./fly.sh uas@10.42.0.223     a different drone (from the laptop)
 #   ./fly.sh -- --icr ir         pass the rest to fcb_record.py
 #   ./fly.sh --status            is it up, and is it recording?
-#   ./fly.sh --stop              stop the recorder so the mp4 closes properly
+#   ./fly.sh --stop              stop the recorder so the video closes properly
 #   ./fly.sh --no-deploy         skip the copy, but still restart and attach
 #   ./fly.sh --no-attach         leave it running, do not open the pane
+#   ./fly.sh --attach            just watch the running recorder, change nothing
 #   ./fly.sh --fetch             just copy recordings off, change nothing
 #   ./fly.sh --no-fetch          do not offer to copy anything on the way out
 #   ./fly.sh --force             act even while a recording is in progress
+#   ./fly.sh --restart           restart a running recorder even with no new code
+#   ./fly.sh --no-pixhawk        run without a flight controller: r records, r r stops
+#   ./fly.sh --autostart         start recording as soon as it is up (no ch8 needed)
 #
 # This is deploy.sh + start_recorder.sh + tmux attach in one step, with the
 # checks that matter between them:
@@ -21,8 +25,9 @@
 #     restarting the recorder to load new code would end that recording;
 #   - it restarts the recorder after a deploy, since a process already
 #     running keeps the old code no matter what was just copied over;
-#   - it notices when it is already running on the drone, instead of
-#     SSHing into itself for a password and a deploy with nothing to copy;
+#   - it notices when it is already running on the drone -- any Jetson,
+#     whatever its address on the link or the WiFi -- instead of SSHing
+#     into itself for a password and a deploy with nothing to copy;
 #   - it holds one SSH connection open for the whole run, so a password
 #     prompt (if you have not set up keys) happens once instead of four
 #     times;
@@ -33,13 +38,14 @@
 #     name the host on the command line.
 #
 # Once the pane is open:  1 RGB  2 IR  3 RGB+IR  4 AUTO  i cycle  ? status
+#                         r record  r r (or x x) stop -- ch8 on the transmitter also works
 #                         Ctrl-b then d detaches and leaves it recording.
 set -uo pipefail
 
 # Addresses the drone is known to answer on, tried in this order. The
 # first is the wired/hotspot link, which is the one that does not change;
 # the rest are WiFi leases, which do. FCB_ORIN overrides the lot.
-CANDIDATES=(${FCB_ORIN_CANDIDATES:-uas@10.42.0.223 uas@192.168.1.103 uas@192.168.0.32})
+CANDIDATES=(${FCB_ORIN_CANDIDATES:-uas@10.42.0.224 uas@10.42.0.223 uas@192.168.0.77 uas@uas-desktop.local uas@192.168.1.103})
 TARGET="${FCB_ORIN:-}"
 REMOTE_DIR="${FCB_REMOTE_DIR:-fcb_orin}"
 SESSION="${FCB_TMUX_SESSION:-fcb}"
@@ -53,19 +59,26 @@ DEPLOY=1
 ATTACH=1
 OFFER=1
 FORCE=0
+RESTART=0
+CHANGED=0
 ACTION=fly
 EXTRA=()
+OPTS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --status)     ACTION=status; shift ;;
         --stop)       ACTION=stop; shift ;;
         --no-deploy)  DEPLOY=0; shift ;;
         --no-attach)  ATTACH=0; shift ;;
+        --attach)     ACTION=attach; shift ;;
         --fetch)      ACTION=fetch; shift ;;
         --no-fetch)   OFFER=0; shift ;;
         --force)      FORCE=1; shift ;;
-        --help|-h)    sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
-        --)           shift; EXTRA=("$@"); break ;;
+        --restart)    RESTART=1; shift ;;
+        --no-pixhawk|--no-mavlink) OPTS+=(--no-mavlink); RESTART=1; shift ;;
+        --autostart)  OPTS+=(--autostart); RESTART=1; shift ;;
+        --help|-h)    sed -n '2,41p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+        --)           shift; EXTRA+=("$@"); break ;;
         -*)           die "unknown option $1 (--help for the list)" ;;
         *)            TARGET="$1"; shift ;;
     esac
@@ -123,10 +136,21 @@ resolve_target() {
     warn "no drone answered on: ${CANDIDATES[*]}"
 }
 
-[[ -n "$TARGET" ]] || resolve_target
+# On the drone itself nothing about addresses matters: whichever link or
+# WiFi network it is on, and whatever IP the SSH session came in from, the
+# bundle and the camera are right here. A Jetson is the drone -- the laptop
+# never is -- so that settles it before any candidate address is consulted,
+# and only an explicit target on the command line points elsewhere.
+on_drone() { [[ -f /etc/nv_tegra_release ]]; }
 
 LOCAL=0
-is_local_target "$TARGET" && LOCAL=1
+if [[ -z "$TARGET" ]] && on_drone; then
+    TARGET="$(whoami)@localhost"
+    LOCAL=1
+else
+    [[ -n "$TARGET" ]] || resolve_target
+    is_local_target "$TARGET" && LOCAL=1
+fi
 
 # -- one connection for the whole run ----------------------------------
 #
@@ -180,6 +204,10 @@ fi
 # come with it, so the first answer is remembered and offered as the
 # default from then on.
 OFFERED=0
+#: Where the drone keeps recordings, relative to the drone user's home --
+#: the same default fcb_record.py uses. FCB_RECORD_DIR overrides both.
+RECORD_DIR="${FCB_RECORD_DIR:-flight_recordings}"
+RECORD_DIR="${RECORD_DIR#\~/}"; RECORD_DIR="${RECORD_DIR#$HOME/}"
 DEST_MEMO="${XDG_CONFIG_HOME:-$HOME/.config}/fcb_orin/gcs_dest"
 
 default_destination() {
@@ -197,19 +225,25 @@ remember_destination() {
     printf '%s\n' "$1" > "$DEST_MEMO" 2>/dev/null || true
 }
 
-#: Files, newest first, as "<mp4> <csv>" pairs. Only pairs: a video whose
+#: Files, newest first, as "<video> <csv>" pairs. Only pairs: a video whose
 #: telemetry is still being written is half a recording.
+#:
+#: Both containers are matched. The recorder writes .avi now, but flights
+#: made before that change are .mp4 and are still worth fetching. A
+#: session's later segments (-2, -3) are deliberately not listed as pairs
+#: of their own -- they share the first segment's CSV.
 recording_pairs() {
     local which="$1"      # newest | today
-    orin "ls -t ~/fcb_recordings/fcb-*.mp4 2>/dev/null" 2>/dev/null | {
-        local count=0 mp4 base
-        while read -r mp4; do
-            [[ -n "$mp4" ]] || continue
-            base="${mp4%.mp4}"
+    orin "ls -t ~/$RECORD_DIR/fcb-*.avi ~/$RECORD_DIR/fcb-*.mp4 2>/dev/null" 2>/dev/null | {
+        local count=0 vid base
+        while read -r vid; do
+            [[ -n "$vid" ]] || continue
+            base="${vid%.*}"
+            case "$base" in *-[0-9]) continue ;; esac
             if [[ "$which" == today ]]; then
-                case "$mp4" in *"fcb-$(date +%Y%m%d)-"*) ;; *) continue ;; esac
+                case "$vid" in *"fcb-$(date +%Y%m%d)-"*) ;; *) continue ;; esac
             fi
-            printf '%s %s.csv\n' "$mp4" "$base"
+            printf '%s %s.csv\n' "$vid" "$base"
             count=$((count + 1))
             [[ "$which" == newest && $count -ge 1 ]] && break
         done
@@ -237,9 +271,14 @@ copy_out() {
         say "copying to $dest"
         if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" \
                  "mkdir -p '$path'" 2>/dev/null; then
+            local hint="$host"
+            # No user in the destination means "the same user name as on
+            # the drone", which is rarely the laptop's -- the usual cause.
+            [[ "$host" == *@* ]] || hint="<laptop-user>@$host"
             warn "cannot log in to $host from the drone without a password.
          Nothing was copied. Either set that up once, from the drone:
-             ssh-copy-id $host
+             ssh-copy-id $hint
+         (and press [e] next time to set the destination to $hint:$path)
          or pull them from the other machine instead:
              scp $(whoami)@$(hostname -I | awk '{print $1}'):'${files[0]}' ."
             return 1
@@ -269,10 +308,10 @@ offer_recordings() {
     pair="$(recording_pairs newest)"
     [[ -n "$pair" ]] || return 0
 
-    local mp4 csv
-    read -r mp4 csv <<<"$pair"
+    local vid csv
+    read -r vid csv <<<"$pair"
 
-    if still_growing "$mp4"; then
+    if still_growing "$vid"; then
         warn "the newest recording is still being written -- not copying it.
          Stop the recording (ch8 low, or ./fly.sh --stop) and run
          ./fly.sh --fetch"
@@ -280,8 +319,8 @@ offer_recordings() {
     fi
 
     local size when
-    size="$(orin "du -ch '$mp4' '$csv' 2>/dev/null | tail -1 | cut -f1")"
-    when="$(orin "date -r '$mp4' '+%H:%M' 2>/dev/null")"
+    size="$(orin "du -ch '$vid' '$csv' 2>/dev/null | tail -1 | cut -f1")"
+    when="$(orin "date -r '$vid' '+%H:%M' 2>/dev/null")"
 
     local dest
     dest="$(default_destination)"
@@ -289,12 +328,12 @@ offer_recordings() {
         # Not an SSH session and nothing remembered: there is no sensible
         # guess, and inventing one would copy someone's flight somewhere
         # they did not ask for.
-        say "recordings are in ~/fcb_recordings on this machine"
+        say "recordings are in ~/$RECORD_DIR on this machine"
         return 0
     fi
 
     echo
-    say "latest recording: $(basename "$mp4") + .csv  ($size, finished $when)"
+    say "latest recording: $(basename "$vid") + .csv  ($size, finished $when)"
     [[ $LOCAL -eq 1 ]] && say "would go to: $dest"
 
     local answer
@@ -359,8 +398,24 @@ if tmux has-session -t "$SESSION" 2>/dev/null; then
     for pid in $(pgrep -P "$pane" 2>/dev/null); do
         case "$(ps -o comm= -p "$pid" 2>/dev/null)" in python*) recorder=yes ;; esac
     done
-    if tmux capture-pane -p -J -t "$SESSION:.0" 2>/dev/null | tail -4 | grep -q '| REC '; then
-        recording=yes
+    # The recorder's own published status line first: rewritten four times
+    # a second and deleted when it stops, so a fresh one is the truth. The
+    # pane is only the fallback, and read without its blank lines -- its
+    # bottom four used to decide this, and on a tall pane, or with the zoom
+    # or flight-name prompt showing, that was blank space or a prompt: "not
+    # recording", and the restart that followed cut a flight short.
+    state=""
+    for f in "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/fcb_gcs_state" /tmp/fcb_gcs_state; do
+        [ -f "$f" ] && { state="$f"; break; }
+    done
+    if [ -n "$state" ] && [ $(( $(date +%s) - $(stat -c %Y "$state") )) -le 10 ]; then
+        grep -q 'REC ' "$state" && recording=yes
+    else
+        # The latest status line, live or logged -- not any line that ever
+        # said REC, which would still be there after a recording stopped.
+        last="$(tmux capture-pane -p -J -t "$SESSION:.0" -S -200 2>/dev/null \
+                | grep -v '^[[:space:]]*$' | grep -E 'fps \||no video \|' | tail -1)"
+        case "$last" in *"REC "*) recording=yes ;; esac
     fi
 fi
 echo "$session $recorder $recording"
@@ -394,6 +449,20 @@ stop)
     # offer follows the stop rather than making it a second command.
     [[ $code -eq 0 ]] && offer_recordings
     exit $code
+    ;;
+attach)
+    # Deliberately does nothing but attach. --no-deploy still restarts the
+    # recorder, which is the opposite of what someone who only wants to
+    # watch a flight in progress is asking for.
+    describe
+    if [[ $SESSION_UP != yes ]]; then
+        die "no tmux session '$SESSION' on $([[ $LOCAL -eq 1 ]] && echo "this machine" || echo "$TARGET").
+       Start it with: ./fly.sh"
+    fi
+    say "attaching (Ctrl-b then d detaches and leaves it recording)"
+    attach
+    offer_recordings
+    exit 0
     ;;
 fetch)
     offer_recordings
@@ -448,16 +517,19 @@ if [[ $DEPLOY -eq 1 ]]; then
 
     say "copying the bundle to $TARGET:$REMOTE_DIR"
     if command -v rsync >/dev/null 2>&1; then
-        rsync -a --delete \
+        CHANGED_FILES="$(rsync -a --delete --itemize-changes \
             --exclude '__pycache__' --exclude '*.pyc' \
             --exclude '.git' --exclude '.pytest_cache' \
             -e "ssh ${SSH_OPTS[*]}" \
-            "$HERE/" "$TARGET:$REMOTE_DIR/" || die "copy failed"
+            "$HERE/" "$TARGET:$REMOTE_DIR/")" || die "copy failed"
+        # Only files that actually changed make a restart worth its risk.
+        grep -qE '^(<f|\*deleting)' <<<"$CHANGED_FILES" && CHANGED=1
     else
         warn "rsync not found, falling back to scp"
         orin "mkdir -p '$REMOTE_DIR'"
         scp -q "${SSH_OPTS[@]}" -r "$HERE"/*.py "$HERE"/*.sh "$HERE/README.md" \
             "$HERE/fcb_base_driver" "$TARGET:$REMOTE_DIR/" || die "copy failed"
+        CHANGED=1     # scp cannot say what changed
     fi
     orin "chmod +x '$REMOTE_DIR'/*.sh '$REMOTE_DIR'/fcb_record.py"
 elif [[ $LOCAL -eq 1 ]]; then
@@ -471,12 +543,110 @@ fi
 # Unconditionally restarted after a deploy: a running process holds the
 # code it started with, so copying a new fcb_record.py over the top of a
 # live recorder changes nothing until it comes back.
+# But only when there is new code to load. On the Oppila board, stopping
+# and reopening the video stream can wedge it until its 12 V is cycled
+# (seen 5 Oct: "Failed to set UVC probe control: -71" straight after a
+# restart), so a running recorder with nothing new to run is left alone
+# and attached to. --restart forces one anyway.
+if [[ $RECORDER_UP == yes && $CHANGED -eq 0 && $RESTART -eq 0 ]]; then
+    say "recorder already running and no code changed -- leaving it running
+    (restarting can wedge the camera board's video; ./fly.sh --restart forces it)"
+    if [[ $ATTACH -eq 1 ]]; then
+        style_session
+        attach
+        offer_recordings
+    fi
+    exit 0
+fi
 if [[ $SESSION_UP == yes ]]; then
-    say "stopping the running recorder so the new code is what runs"
+    if [[ $RECORDER_UP == yes ]]; then
+        say "stopping the running recorder so the new code is what runs"
+    fi
     orin "cd '$WORK_DIR' && ./start_recorder.sh --stop" || die "could not stop it"
 fi
 
+# -- the drone's clock ------------------------------------------------
+#
+# The Orin keeps no time while powered off -- no RTC backup battery -- so
+# each power-up it restarts from the last time it saved (it came back to
+# 01:16 on 4 Oct over and over) until it reaches an internet time server,
+# which in the field it never does. Recordings are named by that clock:
+# afternoon flights were filed as 01:xx and looked like they had not been
+# saved. The laptop's clock is right, so before recording the drone is set
+# from it whenever the drone has not synced on its own. Never fatal.
+sync_drone_clock() {
+    local synced
+    synced="$(orin "timedatectl show -p NTPSynchronized --value 2>/dev/null")"
+    [[ "$synced" == yes ]] && return 0
+    local ref drone src
+    if [[ $LOCAL -eq 1 ]]; then
+        # The laptop this session came from, as the copy destination knows it.
+        src="$(default_destination)"; src="${src%%:*}"
+        [[ -n "$src" && "$src" == *@* ]] || {
+            warn "drone clock not synced and no laptop to take the time from"
+            return 0; }
+        ref="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$src" 'date +%s' 2>/dev/null)"
+    else
+        src="this laptop"
+        ref="$(date +%s)"
+    fi
+    drone="$(orin "date +%s")"
+    [[ "$ref" =~ ^[0-9]+$ && "$drone" =~ ^[0-9]+$ ]] || {
+        warn "could not compare the drone's clock with $src -- recording
+         names may carry the wrong time"; return 0; }
+    local off=$(( ref - drone )); local abs=${off#-}
+    (( abs <= 2 )) && return 0
+    # The laptop's time read again, just now, so the time spent above is
+    # not left as error.
+    if [[ $LOCAL -eq 1 ]]; then
+        ref="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$src" 'date +%s' 2>/dev/null)"
+    else
+        ref="$(date +%s)"
+    fi
+    [[ "$ref" =~ ^[0-9]+$ ]] || { warn "lost $src while setting the drone clock"; return 0; }
+    if orin "sudo -n date -s @$ref >/dev/null 2>&1"; then
+        say "drone clock was off by ${off}s -- set from $src ($(orin "date '+%F %T'"))"
+    else
+        warn "drone clock is off by ${off}s and could not be set (needs
+         passwordless sudo) -- recording names will carry the wrong time"
+    fi
+}
+sync_drone_clock
+
+# -- which camera board ------------------------------------------------
+#
+# The camera reaches the Orin through an interface board, and the NeoHD
+# one does not even present itself the same way every time: after some
+# power cycles it is a branded "USB3 NeoHD", after others a bare Cypress
+# "FX3 CAMERA" with a different pixel format. The recorder copes with
+# either by itself; this says up front which it is about to find, so a
+# missing or unexpected board shows here rather than after the wait for
+# 'ready'. It asks without opening the video or the VISCA port, which a
+# recorder still running at this point may hold.
+camera="$(orin "cd '$WORK_DIR' && \${FCB_PYTHON:-python3} -m fcb_base_driver.devices" 2>&1)"
+case $? in
+    0)  say "camera: $(head -n 1 <<<"$camera")"
+        note="$(tail -n +2 <<<"$camera")"
+        [[ -n "$note" ]] && warn "the camera board $note" ;;
+    1)  if [[ -n "${FCB_BOARD_POWER_CYCLE:-}" ]]; then
+            say "no camera board on USB -- power-cycling it: $FCB_BOARD_POWER_CYCLE"
+            orin "$FCB_BOARD_POWER_CYCLE" || warn "the power-cycle command failed"
+            for _ in $(seq 1 20); do
+                orin "lsusb | grep -q 04b4:" && { say "camera board is back"; break; }
+                sleep 1
+            done
+        else
+            warn "no known camera board is on USB. If it is plugged in and powered,
+         it is stuck: the Oppila board does not come back after the Orin boots
+         or reboots while it stays powered. Cycle its 12 V supply. (Set
+         FCB_BOARD_POWER_CYCLE to a command that does it, and this script and
+         the recorder will.)"
+        fi ;;
+    *)  warn "could not identify the camera board: $camera" ;;
+esac
+
 ARGS=""
+EXTRA=(${OPTS[@]+"${OPTS[@]}"} ${EXTRA[@]+"${EXTRA[@]}"})
 if ((${#EXTRA[@]})); then
     ARGS=" -- $(printf '%q ' "${EXTRA[@]}")"
     say "recorder options:${ARGS#* -- }"
@@ -501,8 +671,8 @@ done
 
 echo
 orin "tmux capture-pane -p -t '$SESSION:.0' 2>/dev/null | grep -v '^\$' \
-      | grep -E 'VISCA|MAVLink:|video:|zoom:|imaging mode|ready --|keys:|ERROR|CRITICAL' \
-      | tail -12"
+      | grep -E 'VISCA|MAVLink:|video:|zoom:|imaging mode|image stabilizer|ready --|keys:|ERROR|CRITICAL' \
+      | tail -16"
 echo
 
 style_session
@@ -511,7 +681,11 @@ style_session
 # line has printed several times and pushed 'ready --' well past a 20-line
 # tail, which made a healthy recorder report as a failed one on every launch.
 if orin "tmux capture-pane -p -t '$SESSION:.0' 2>/dev/null | grep -q 'ready --'"; then
-    say "recorder is up. Recording is armed on RC ch8: high starts, low stops."
+    case " ${EXTRA[*]-} " in
+        *" --autostart "*)  say "recorder is up and RECORDING (--autostart). r r in the pane stops it." ;;
+        *" --no-mavlink "*) say "recorder is up, no Pixhawk: r in the pane starts recording, r r stops." ;;
+        *)                  say "recorder is up. Recording is armed on RC ch8 (high starts, low stops), or r in the pane." ;;
+    esac
 else
     warn "the recorder did not report 'ready' within 20s -- it may still be
          probing, or something above failed. The pane has the detail."
@@ -521,6 +695,7 @@ cat <<KEYS
 
   In the pane:  1 RGB  2 IR  3 RGB+IR  4 AUTO  i cycle  s snapshot
                 z 7.3 Enter  zoom to an exact value    a  knob back
+                r  start recording        r r / x x  stop it (and name it)
                 Ctrl-b then d  detach, leaving it recording
                 ./fly.sh --stop  land it, then offer the footage
                 ./fly.sh --fetch copy recordings over, change nothing

@@ -69,6 +69,11 @@ class RcButton(_RcChannel):
     def pressed(self):
         pwm = self.pwm()
         if pwm is None:
+            # Forget where it was. The first sample after RC comes back only
+            # re-establishes the position, as at startup -- otherwise a switch
+            # read low before a dropout and high after it fired a press nobody
+            # made, exactly what the module docstring promises cannot happen.
+            self._high = None
             return False
         high = pwm >= self.threshold
         if self.reverse:

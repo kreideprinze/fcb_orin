@@ -26,6 +26,24 @@ except ImportError:  # pymavlink is an optional dependency of the caller
 
 MAX_RC_CHANNELS = 18
 
+#: A link this quiet is treated as gone, and reconnected. ArduPilot streams
+#: several messages a second once asked; a port that stays open but goes
+#: silent -- the autopilot rebooted without the USB dropping, or the link
+#: froze -- otherwise read as "connected" for ever, with the stream request
+#: that a reconnect would re-send never sent again.
+SILENCE_TIMEOUT = 5.0
+
+#: Plausible RC pulse widths. MAVLink marks an unused channel with
+#: UINT16_MAX (65535), and anything outside this band is not a stick or a
+#: switch -- read as a real value, 65535 is "switch high" and would start a
+#: recording on a channel the transmitter does not even send.
+PWM_VALID = (800, 2200)
+
+
+def _pwm_or_absent(value):
+    value = int(value or 0)
+    return value if PWM_VALID[0] <= value <= PWM_VALID[1] else 0
+
 
 @dataclass
 class Telemetry:
@@ -150,13 +168,19 @@ class MavlinkSource:
 
     def _run(self):
         connection = None
+        last_rx = 0.0
         while self._running:
             try:
                 if connection is None:
                     connection = self._connect()
+                    last_rx = time.monotonic()
                 msg = connection.recv_match(blocking=True, timeout=1.0)
                 if msg is not None:
+                    last_rx = time.monotonic()
                     self._on_message(msg)
+                elif time.monotonic() - last_rx > SILENCE_TIMEOUT:
+                    raise RuntimeError(
+                        f"no MAVLink traffic for {SILENCE_TIMEOUT:.0f}s")
             except Exception as exc:
                 with self._lock:
                     self._connected = False
@@ -205,11 +229,26 @@ class MavlinkSource:
         kind = msg.get_type()
         now = time.monotonic()
 
-        if kind in ("RC_CHANNELS", "RC_CHANNELS_RAW"):
-            values = [int(getattr(msg, f"chan{i}_raw", 0) or 0)
+        if kind == "RC_CHANNELS":
+            # Channels past chancount are not being sent by the transmitter.
+            count = int(getattr(msg, "chancount", MAX_RC_CHANNELS) or 0) \
+                or MAX_RC_CHANNELS
+            values = [_pwm_or_absent(getattr(msg, f"chan{i}_raw", 0))
+                      if i <= count else 0
                       for i in range(1, MAX_RC_CHANNELS + 1)]
             with self._lock:
                 self._channels = values
+                self._rc_rx = now
+
+        elif kind == "RC_CHANNELS_RAW":
+            # Only channels 1-8 exist in this (MAVLink 1) message. Writing
+            # all 18 from it zeroed 9-18 on every one, and on a link that
+            # carries both messages the snapshot (9) and imaging-mode (10)
+            # channels flickered between their real value and "absent".
+            with self._lock:
+                for i in range(1, 9):
+                    self._channels[i - 1] = _pwm_or_absent(
+                        getattr(msg, f"chan{i}_raw", 0))
                 self._rc_rx = now
 
         elif kind == "GLOBAL_POSITION_INT":

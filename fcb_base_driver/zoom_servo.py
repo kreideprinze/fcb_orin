@@ -27,6 +27,23 @@ from fcb_base_driver.visca_link import ViscaError, ViscaTimeout
 
 ACTIVE_INTERVAL = 0.05  # 20 Hz while actually driving towards a target
 IDLE_INTERVAL = 0.2     # 5 Hz once parked -- just enough to stay current
+
+#: Poll period on a link that pads its replies out of the board (the Oppila
+#: board, see visca_link.py). Every exchange there costs a padded round trip
+#: of ~0.15-0.25 s and eight extra commands to the camera; polling at the
+#: rates above flooded it: an exchange timed out about every 3 s, and four
+#: minutes in the camera stopped answering VISCA altogether until
+#: power-cycled -- possibly the flood, possibly not, but not worth the risk.
+#: Twice a second is plenty once the camera drives to targets itself (below).
+PADDED_INTERVAL = 0.5
+#: On such a link the lens is not steered with tele/wide/stop: the stop
+#: decision rests on a position that is a padded round trip old, several
+#: times the INQUIRY_LATENCY the coast model assumes, so it would overshoot.
+#: The camera is given the target position instead (CAM_Zoom Direct) and
+#: drives the lens there itself. The target is re-sent if the lens has been
+#: well off it for this long -- a command lost on the way, or the lens moved
+#: by something else.
+DIRECT_RESEND_AFTER = 2.0
 MAX_SPEED = 7
 
 #: What the lens actually does, measured on an FCB-EV9520L over VISCA at
@@ -112,6 +129,9 @@ class ZoomServo:
         self.source = source if rc is not None else "manual"
         self._status = on_status or (lambda msg: None)
         self._link_factory = link_factory
+        self._reconnect_misses = 0
+        self._direct_target = None
+        self._direct_sent_at = 0.0
         self._faults = 0
         self._last_reconnect = 0.0
 
@@ -219,7 +239,10 @@ class ZoomServo:
                                  f"({self._faults} in a row)")
                 if self._faults >= FAULTS_BEFORE_RECONNECT:
                     self._reconnect()
-            time.sleep(ACTIVE_INTERVAL if self.is_driving else IDLE_INTERVAL)
+            if self._direct():
+                time.sleep(PADDED_INTERVAL)
+            else:
+                time.sleep(ACTIVE_INTERVAL if self.is_driving else IDLE_INTERVAL)
 
     def _reconnect(self):
         """Rebuild a VISCA link that has stopped answering."""
@@ -240,10 +263,21 @@ class ZoomServo:
             self._status(f"zoom: VISCA reconnect failed: {exc}")
             return
         if link is None:
+            # Said, not swallowed: the sweep can take tens of seconds against
+            # a board that has stopped answering USB control requests, and a
+            # silent servo looks exactly like a working one with nothing to do.
+            self._reconnect_misses += 1
+            if self._reconnect_misses == 1 or self._reconnect_misses % 10 == 0:
+                self._status("zoom: camera control not found -- still looking "
+                             f"(attempt {self._reconnect_misses}). If the "
+                             "camera board was unplugged or reset, it may "
+                             "need its power cycled")
             return
+        self._reconnect_misses = 0
         self.link = link
         self.is_driving = False
         self._faults = 0
+        self._direct_target = None
         self._status("zoom: VISCA link re-established")
 
     def _tick(self):
@@ -271,6 +305,10 @@ class ZoomServo:
             self.target_ratio = zoom_map.position_to_ratio(target)
         error = target - self.position
         distance = abs(error)
+
+        if self._direct():
+            self._drive_direct(target, distance)
+            return
 
         if target != self._parked_at:
             self._trims = 0
@@ -308,6 +346,21 @@ class ZoomServo:
             self.link.zoom_wide(speed)
         self.is_driving = True
         self._parked_at = None
+
+    def _direct(self):
+        """Whether this link is driven by target position (see PADDED_INTERVAL)."""
+        return bool(getattr(self.link, "pad_replies", False))
+
+    def _drive_direct(self, target, distance):
+        """Hand the camera the target position; it drives the lens there."""
+        now = time.monotonic()
+        stale = (distance > RESUME_BAND
+                 and now - self._direct_sent_at >= DIRECT_RESEND_AFTER)
+        if target != self._direct_target or stale:
+            self.link.zoom_direct(target)
+            self._direct_target = target
+            self._direct_sent_at = now
+        self.is_driving = distance > FINE_BAND
 
     @staticmethod
     def _stop_distance(speed):

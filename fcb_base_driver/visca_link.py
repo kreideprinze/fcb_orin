@@ -12,6 +12,19 @@ drained on the next exchange.
 
 The link takes an exclusive `flock` on the serial device so a second node
 (or a stray CLI tool) cannot interleave bytes into the same stream.
+
+Some USB boards hold replies back. The Oppila LVDS-USB3 board's serial
+bridge only passes camera bytes to the host in full 32-byte packets -- on
+the drone every read that returned anything was exactly 32 bytes, holding
+the replies to several earlier exchanges -- so a lone 3-7 byte reply sits
+in the board until enough later ones pile up behind it. Commands still
+take effect at once; it is only the answer that is stuck. For those
+boards the link pads: while it is waiting on a reply it sends broadcast
+Address Set packets, whose 4-byte `88 30 02 FF` answers fill the packet
+and push the real reply out. Address Set only renumbers cameras on the
+bus, and with the one camera there it is already address 1, so it changes
+nothing; its answers classify as UNKNOWN and are dropped like any other
+frame the link is not waiting for.
 """
 import fcntl
 import threading
@@ -30,23 +43,87 @@ class ViscaTimeout(RuntimeError):
     """No complete reply frame arrived within the timeout."""
 
 
+#: Broadcast Address Set; answered with the 4-byte `88 30 02 FF`.
+_PAD = bytes([0x88, 0x30, 0x01, 0xFF])
+#: Eight answers are 32 bytes: one full packet behind the awaited reply,
+#: however much of the previous packet was already sitting in the board.
+_PADS = _PAD * 8
+#: How long a reply may be quiet before the link pads to push it out.
+_PAD_AFTER = 0.05
+#: And how long after padding before padding again. Eight pads took
+#: 120-180 ms to come back on the drone; padding faster than that floods
+#: the camera, and the board then went silent altogether.
+_PAD_AGAIN = 0.4
+
+
+def _check_position_reply(payload: bytes, what: str) -> None:
+    """Reject a position reply that is not 50 0p 0q 0r 0s.
+
+    VISCA carries no checksum, and a board that damages bytes in transit
+    (the Oppila one does, while streaming) can turn a position into another
+    plausible-looking one -- which the zoom servo would then "correct" by
+    moving the lens. The one thing that can be checked is the shape: four
+    data bytes, each a single nibble. A reply that fails it is an error to
+    retry, not a reading.
+    """
+    if (len(payload) != 5 or payload[0] != 0x50
+            or any(b > 0x0F for b in payload[1:])):
+        raise ViscaError(f"corrupt {what} reply: {payload.hex(' ')}")
+
+
 class ViscaLink:
     """Exclusive, framed serial link to a VISCA camera."""
 
     def __init__(self, port: str, baud: int = 9600, address: int = 1,
-                 timeout: float = 0.25):
+                 timeout: float = 0.25, pad_replies: bool = None):
+        """`pad_replies` None decides from the port's USB ID: on for boards
+        known to hold replies back (devices.CHUNKED_REPLY_USB_IDS)."""
         self.address = address
         self.timeout = timeout
         self._lock = threading.Lock()
+        if pad_replies is None:
+            # Imported here: devices imports this module.
+            from fcb_base_driver import devices
+            pad_replies = devices.usb_id(port) in devices.CHUNKED_REPLY_USB_IDS
+        self.pad_replies = pad_replies
+        if pad_replies:
+            # A padded answer takes 120-250 ms on the Oppila board, now and
+            # then 500, against the 0.25 s callers pass for a direct board.
+            # Too short a limit turns every slow answer into a timeout and a
+            # resync, which costs more than the wait it was meant to save.
+            self.timeout = timeout = max(timeout, 1.0)
+        # Set when a padded exchange times out: its reply may still turn up
+        # later, behind the board's packet boundary, and must not be taken
+        # for the answer to the next question. Starts set on a padded link,
+        # since the board can still be holding bytes from whoever had the
+        # port before -- on the drone, the first exchange after opening
+        # timed out until this was done.
+        self._desynced = pad_replies
+        self._padded_at = 0.0
 
-        self._ser = serial.Serial(
-            port=port,
-            baudrate=baud,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=timeout,
-        )
+        # Right after a USB camera board re-enumerates, its tty can exist but
+        # not yet take ioctls, and pyserial's line setup then fails with a
+        # plain OSError rather than a SerialException. That race is
+        # sub-second, so it is retried; a SerialException (no such port,
+        # permission denied) is not, since retrying cannot fix it and the
+        # autodetect sweep would pay for every attempt.
+        for attempt in range(1, 4):
+            try:
+                self._ser = serial.Serial(
+                    port=port,
+                    baudrate=baud,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=timeout,
+                )
+                break
+            except serial.SerialException:
+                raise
+            except OSError:
+                if attempt == 3:
+                    raise
+                time.sleep(0.5)
         try:
             fcntl.flock(self._ser.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
@@ -57,6 +134,10 @@ class ViscaLink:
 
         self._ser.reset_input_buffer()
         self._ser.reset_output_buffer()
+        if self.pad_replies:
+            # Short reads, so a quiet line is noticed in time to pad rather
+            # than only once the whole exchange has already timed out.
+            self._ser.timeout = min(timeout, _PAD_AFTER / 2)
 
     # -- lifecycle -----------------------------------------------------
 
@@ -75,16 +156,47 @@ class ViscaLink:
 
     # -- framing -------------------------------------------------------
 
+    def _pad(self) -> None:
+        self._ser.write(_PADS)
+        self._ser.flush()
+        self._padded_at = time.monotonic()
+
     def _read_frame(self, deadline: float) -> bytes:
-        """Read bytes up to and including the next 0xFF terminator."""
+        """Read bytes up to and including the next 0xFF terminator.
+
+        On a padded link, a quiet line is padded again -- but never sooner
+        than _PAD_AGAIN after the last pads, however many frames arrived in
+        between. Timing it per frame instead re-padded every _PAD_AFTER
+        while the previous pads' answers trickled in, flooding the camera
+        until the board went silent.
+        """
         frame = bytearray()
+        quiet_since = time.monotonic()
         while time.monotonic() < deadline:
             byte = self._ser.read(1)
             if not byte:
+                now = time.monotonic()
+                if (self.pad_replies and now - quiet_since >= _PAD_AFTER
+                        and now - self._padded_at >= _PAD_AGAIN):
+                    self._pad()
                 continue
+            quiet_since = time.monotonic()
+            value = byte[0]
+            if frame and 0x80 <= value < 0xFF:
+                # A header byte inside a frame: the terminator of the frame
+                # before was lost, so a new one starts here. In a VISCA reply
+                # only headers (0x80-0xFE) and the 0xFF terminator have the
+                # top bit set; every data byte is below 0x80. Measured on the
+                # Oppila board while it streams: a quarter of replies lost or
+                # damaged, many as two run together ("88 30 02 88 30 02 FF").
+                # Without this, both were thrown away -- one of them, often,
+                # the answer being waited for.
+                frame = bytearray()
             frame += byte
-            if byte[0] == 0xFF:
+            if value == 0xFF:
                 return bytes(frame)
+            if len(frame) > 16:
+                frame = bytearray()     # no VISCA reply is this long: noise
         raise ViscaTimeout(
             f"no complete frame within {self.timeout}s (partial: {frame.hex()})"
         )
@@ -106,7 +218,12 @@ class ViscaLink:
         timeout = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
         while True:
-            frame = self._read_frame(deadline)
+            try:
+                frame = self._read_frame(deadline)
+            except ViscaTimeout:
+                if self.pad_replies:
+                    self._desynced = True
+                raise
             kind, payload = visca.classify(frame)
             if kind == visca.ERROR:
                 raise ViscaError(visca.error_message(payload))
@@ -115,11 +232,37 @@ class ViscaLink:
             # Otherwise: an ACK we are not waiting on, or a late completion
             # from a previous command. Drop it and keep reading.
 
+    def _resync(self) -> None:
+        """Discard whatever is queued in the board behind a timed-out reply.
+
+        Sends sixteen pads and reads until eight of their answers are back.
+        Their answers come after anything older, so everything ahead of them
+        is stale and dropped, and what stays held in the board afterwards is
+        only more pad answers -- which the next exchange ignores anyway.
+        """
+        self._ser.write(_PADS)
+        self._pad()
+        deadline = time.monotonic() + max(self.timeout, 1.0)
+        seen = 0
+        while seen < 8:
+            frame = self._read_frame(deadline)
+            if frame == bytes([0x88, 0x30, 0x02, 0xFF]):
+                seen += 1
+        self._desynced = False
+
     def _exchange(self, packet: bytes, want: str, timeout: float = None,
                   min_payload: int = 0) -> bytes:
         """Write `packet`, then wait for a reply frame of kind `want`."""
+        if self._desynced:
+            self._resync()
+        # Pads straight behind the packet, not after a quiet spell: measured
+        # on the drone, ~180 ms per answer this way against ~800 ms when
+        # the link first waited to see whether the reply came on its own.
         self._ser.write(packet)
-        self._ser.flush()
+        if self.pad_replies:
+            self._pad()
+        else:
+            self._ser.flush()
         return self._await(want, timeout, min_payload)
 
     # -- public API ----------------------------------------------------
@@ -161,6 +304,7 @@ class ViscaLink:
 
     def zoom_position(self) -> int:
         payload = self.inquiry(visca.zoom_pos_inq(self.address))
+        _check_position_reply(payload, "zoom")
         return visca.parse_zoom_pos(payload)
 
     def zoom_direct(self, position: int) -> None:
@@ -177,6 +321,7 @@ class ViscaLink:
 
     def focus_position(self) -> int:
         payload = self.inquiry(visca.focus_pos_inq(self.address))
+        _check_position_reply(payload, "focus")
         return visca.parse_focus_pos(payload)
 
     def if_clear(self) -> None:

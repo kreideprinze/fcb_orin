@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import numpy as np                                    # noqa: E402
+import prefer_cv2  # noqa: E402,F401  -- before cv2
 import cv2                                            # noqa: E402
 import snapshot                                       # noqa: E402
 
@@ -109,7 +110,8 @@ def to_ansi_quadrant(frame, cols, rows, quantum=None):
         out.append("".join(line))
     return "\n".join(out)
 
-DEFAULT_DIR = os.path.expanduser("~/fcb_recordings/snapshots")
+DEFAULT_DIR = os.path.join(os.path.expanduser(
+    os.environ.get("FCB_RECORD_DIR", "~/flight_recordings")), "snapshots")
 
 #: Set FCB_PREVIEW_HALFBLOCK=1 if a terminal or font renders the quadrant
 #: characters badly and the plainer one-pixel-per-half-cell look is wanted.

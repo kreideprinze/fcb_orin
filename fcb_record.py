@@ -46,12 +46,15 @@ recording mid-flight. Ctrl-C, or ./start_recorder.sh --stop, does that.
 """
 import argparse
 import csv
+import glob
 import logging
 import logging.handlers
 import os
+import re
 import select
 import shutil
 import signal
+import subprocess
 import sys
 import termios
 import threading
@@ -82,6 +85,8 @@ def _find_driver_root():
 _DRIVER_ROOT = _find_driver_root()
 if os.path.isdir(_DRIVER_ROOT) and _DRIVER_ROOT not in sys.path:
     sys.path.insert(0, _DRIVER_ROOT)
+
+import prefer_cv2  # noqa: F401  -- before cv2, see prefer_cv2.py
 
 try:
     import cv2
@@ -125,6 +130,9 @@ CSV_COLUMNS = [
     "zoom_position",      # raw VISCA counts, lossless
     "zoom_age_ms",
     "fc_time_boot_ms",    # the Pixhawk's clock, to align with its .bin log
+    "filled",             # 1: a repeat of the previous frame, written to
+                          # cover frames the camera link lost, keeping the
+                          # video in real time; 0: a captured frame
 ]
 
 #: Imaging modes, in the operator's vocabulary rather than Sony's.
@@ -216,9 +224,20 @@ class TerminalKeys:
             return None
         try:
             data = os.read(self._fd, 1)
-        except OSError:
+        except OSError as exc:
+            # A closed descriptor reports readable and then fails, for ever.
+            self._retire(f"the terminal went away ({exc})")
             return None
         if not data:
+            # EOF. The tmux pane was closed, or the window it lived in.
+            # select() now calls this fd readable permanently and every
+            # read returns nothing, so a caller draining on pending()
+            # spins at full tilt -- measured at over a million iterations
+            # in three seconds -- and the capture loop never turns again.
+            # That wedge ends a recording as surely as a crash, which is
+            # why the keyboard is retired here and the flight goes on
+            # without it.
+            self._retire("the terminal closed")
             return None
         if data != b"\x1b":
             return data.decode("utf-8", "replace")
@@ -238,6 +257,16 @@ class TerminalKeys:
         except OSError:
             pass
         return None
+
+    def _retire(self, why):
+        """Give up on the keyboard for good, once, and say so."""
+        if not self.enabled:
+            return
+        self.enabled = False
+        log.warning("%s -- keyboard control is gone for this run, but "
+                    "RECORDING CONTINUES and the RC switches still work. "
+                    "Reattach with ./fly.sh --attach; restart the recorder "
+                    "to get the keys back.", why)
 
     def pending(self):
         """Whether there is anything left to read.
@@ -278,20 +307,35 @@ class LiveLine:
             return
         width = shutil.get_terminal_size((120, 24)).columns
         with self.lock:
-            self.stream.write("\r\033[K" + text[:width - 1])
-            self.stream.flush()
+            self._write("\r\033[K" + text[:width - 1])
             self._shown = True
 
     def clear(self):
         if not self.enabled or not self._shown:
             return
         with self.lock:
-            self.stream.write("\r\033[K")
-            self.stream.flush()
+            self._write("\r\033[K")
             self._shown = False
+
+    def _write(self, text):
+        """Write, or give up on the terminal for good if it has gone.
+
+        A closed pane leaves this an EIO on every write. Raised from here it
+        came out of the logging call that was reporting the closed terminal,
+        and out of whatever was doing the logging -- a status line must never
+        be able to take the recorder down with it.
+        """
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except (OSError, ValueError):
+            self.enabled = False
 
 
 LIVE = LiveLine()
+
+#: Seconds in which the second 'x' must land to confirm a stop.
+STOP_CONFIRM_WINDOW = 5.0
 
 
 class LiveAwareHandler(logging.StreamHandler):
@@ -300,7 +344,10 @@ class LiveAwareHandler(logging.StreamHandler):
     def emit(self, record):
         with LIVE.lock:
             LIVE.clear()
-            super().emit(record)
+            try:
+                super().emit(record)
+            except Exception:
+                pass  # the console is gone; the log file still has it
 
 
 def setup_logging(directory, level, quiet):
@@ -350,8 +397,62 @@ def setup_logging(directory, level, quiet):
     return path
 
 
+#: Container defaults. AVI is the default because of how the two behave
+#: when a write is cut short -- a power cut, a kill -9, a card pulled. An
+#: mp4 keeps its index (the moov atom) at the end, so a truncated one is
+#: not a short video, it is no video at all. AVI's frames are recoverable
+#: without the index. Measured on the drone by truncating a 60-frame clip
+#: to 75%: 43 frames came back out of the AVI and 0 out of the mp4.
+CONTAINERS = {
+    #             GStreamer muxer, OpenCV fourcc for the CPU fallback
+    "avi": ("avimux", "XVID"),
+    "mp4": ("qtmux", "mp4v"),
+}
+
+
+def _to_bgr(frame, yuv_code=cv2.COLOR_YUV2BGR_YUY2):
+    """Whatever the camera handed over, as three-channel BGR.
+
+    The FCB offers only 4:2:2 YUV, and whether OpenCV converts it depends on
+    the backend: with CAP_PROP_CONVERT_RGB off it passes the raw pairs
+    through as a *two*-channel image. Measured that way on a laptop against
+    this same board. The encoder would accept those frames and write
+    nonsense, which is the worst kind of failure here -- a full card and no
+    usable video. Cheap to check, so it is checked. `yuv_code` says which
+    packing those pairs are: YUYV on the NeoHD board, UYVY on the Oppila one.
+    """
+    if frame.ndim == 2:
+        return cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    channels = frame.shape[2]
+    if channels == 3:
+        return frame
+    if channels == 2:
+        return cv2.cvtColor(frame, yuv_code)
+    if channels == 4:
+        return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    return frame
+
+
+def _unique_base(base):
+    """A base path no existing recording is already using.
+
+    The timestamp only resolves to the second, so a stop and an immediate
+    restart -- a twitchy ch8, or the stop key followed by the switch --
+    produces the same name twice, and the second session would overwrite
+    the first without a word. Letters for the suffix, because digits are
+    what the video segments of one session use.
+    """
+    if not glob.glob(glob.escape(base) + ".*"):
+        return base
+    for letter in "bcdefghijklmnopqrstuvwxyz":
+        candidate = f"{base}{letter}"
+        if not glob.glob(glob.escape(candidate) + ".*"):
+            return candidate
+    return f"{base}-{int(time.time() * 1000) % 100000}"
+
+
 class VideoRecorder:
-    """Writes frames to an .mp4, on the GPU where one is available.
+    """Writes frames to a video file, on the GPU where one is available.
 
     Software encoding 1080p60 is roughly 250 MB/s of raw input to chew
     through, which an Orin's CPU will not keep up with while also running
@@ -363,6 +464,8 @@ class VideoRecorder:
 
     def __init__(self, path, width, height, fps, encoder="nvenc", bitrate_mbps=25):
         self.path = path
+        extension = os.path.splitext(path)[1].lstrip(".").lower()
+        self.muxer, self.fourcc = CONTAINERS.get(extension, CONTAINERS["avi"])
         self.width = width
         self.height = height
         self.fps = fps
@@ -380,12 +483,18 @@ class VideoRecorder:
                 return "nvenc", writer
             log.warning(
                 "NVENC/GStreamer writer would not open -- falling back to "
-                "CPU mp4v. Expect dropped frames at 1080p60. Check that this "
-                "OpenCV was built with GStreamer (cv2.getBuildInformation())."
+                "CPU %s. Expect dropped frames at 1080p60. Check that this "
+                "OpenCV was built with GStreamer "
+                "(cv2.getBuildInformation()).", self.fourcc
             )
+        # Whole frames per second here too, for the same reason as NVENC: a
+        # measured rate like 96.67 reaches FFmpeg's mpeg4 encoder as a time
+        # base it rejects ("Could not open codec mpeg4", -22) -- and since
+        # the measurement differs run to run, the CPU fallback opened or
+        # failed at random, leaving recordings with no video.
         writer = cv2.VideoWriter(
-            self.path, cv2.VideoWriter_fourcc(*"mp4v"), self.fps,
-            (self.width, self.height),
+            self.path, cv2.VideoWriter_fourcc(*self.fourcc),
+            float(max(1, int(round(self.fps)))), (self.width, self.height),
         )
         return ("cpu", writer) if writer.isOpened() else ("cpu", None)
 
@@ -406,7 +515,7 @@ class VideoRecorder:
             f"! nvvidconv ! video/x-raw(memory:NVMM),format=NV12 "
             f"! nvv4l2h264enc bitrate={int(bitrate_mbps * 1_000_000)} "
             f"insert-sps-pps=1 maxperf-enable=1 "
-            f"! h264parse ! qtmux ! filesink location={self.path}"
+            f"! h264parse ! {self.muxer} ! filesink location={self.path}"
         )
         log.debug("trying GStreamer pipeline: %s", pipeline)
         try:
@@ -444,7 +553,8 @@ class TelemetryCsv:
         self._writer.writerow(CSV_COLUMNS)
         self._file.flush()
 
-    def write(self, frame_number, wall_utc, t_mono, telemetry, servo, now):
+    def write(self, frame_number, wall_utc, t_mono, telemetry, servo, now,
+              filled=0):
         def ms(age):
             return None if age is None else round(age * 1000, 1)
 
@@ -467,6 +577,7 @@ class TelemetryCsv:
             num(servo.ratio, 2), servo.position, ms(zoom_age),
             telemetry.position_boot_ms if telemetry.position_boot_ms is not None
             else telemetry.attitude_boot_ms,
+            filled if frame_number is not None else None,
         ])
         self.rows += 1
         self._file.flush()
@@ -575,7 +686,44 @@ class SnapshotWorker:
                 log.exception("snapshot: failed; continuing")
 
 
+#: Seconds between looks for a control port that did not answer at launch.
+CONTROL_RETRY = 10.0
+
+
 class Recorder:
+
+    #: How raw two-channel frames are decoded; replaced by open_camera()
+    #: with whatever packing the camera actually negotiated.
+    yuv_code = cv2.COLOR_YUV2BGR_YUY2
+    #: Whether the control port was found on a known USB camera board.
+    control_on_board = False
+    control_baud = None
+    # Defaults for state set in __init__, so a Recorder built without it
+    # (the tests do) still has every field the loop reads.
+    _reopens = 0
+    _blank_checked = 0.0
+    picture_blank = False
+    _switch_raw = None
+    _switch_since = 0.0
+    _switch_settled = None
+    _disk_checked = 0.0
+    disk_free_gb = None
+    _write_failed = False
+    _last_rc_warning = 0.0
+    _segment_failed_at = -1e9
+    repeating_board = False
+    _last_written = None
+    #: Most frames filled in one go. A longer hole is a camera outage, which
+    #: the reopen path handles -- not something to paper over with a still.
+    MAX_FILL_PER_GAP = 3
+    _last_written_at = None
+    _board_cycled_at = -1e9
+    _board_advice_given = False
+    _blank_since = None
+    #: The current recording was started with r or --autostart, not ch8.
+    #: A switch merely sitting low -- or no flight controller at all --
+    #: does not end it; x does, or ch8 flicked up and back down.
+    _by_hand = False
 
     def __init__(self, args):
         self.args = args
@@ -587,11 +735,28 @@ class Recorder:
         self.rc = None
         self.grabber = None
 
+        # A recording session and a video file are no longer the same
+        # thing. `recording` is the flight: it owns the CSV and lasts from
+        # the ch8 flick to a deliberate stop. `video` is one mp4 inside it,
+        # and can come and go if the camera does -- an mp4 cannot span a
+        # gap in its own frame stream, but the flight track can and must.
+        self.recording = False
+        self.segment = 0
         self.video = None
+        self.video_path = None
         self.csv = None
         self.base = None
         self.record_started_mono = None
         self.record_started_wall = None
+        self._last_gap_row = 0.0
+        self._stop_armed = 0.0
+        # Set when a recording is ended by hand while ch8 is still high.
+        # Without it the very next loop iteration sees "switch high, not
+        # recording" and starts a new one, so the stop key would be
+        # useless -- it would just chop the flight into two files.
+        # Cleared when the switch is next seen low, so the transmitter
+        # takes over again as soon as the pilot actually uses it.
+        self._start_suppressed = False
 
         self.icr_mode = None
         self.keys = None
@@ -606,9 +771,27 @@ class Recorder:
 
         # Digits typed after 'z', or None when not entering a zoom.
         self.zoom_entry = None
+        # Characters typed at the "name this flight" prompt, or None. The
+        # base path being named is held alongside, because a new recording
+        # could in principle start while the prompt is still open.
+        self.name_entry = None
+        self._name_base = None
 
         self.frames_seen = 0
         self.frames_dropped = 0
+        # Reopens since the last frame, for backing off (see capture_loop).
+        self._reopens = 0
+        # Blank-picture watch: when last checked, and whether it is blank.
+        self._blank_checked = 0.0
+        self.picture_blank = False
+        # ch8 debounce: the raw reading, since when, and the settled one.
+        self._switch_raw = None
+        self._switch_since = 0.0
+        self._switch_settled = None
+        # Free-space watch.
+        self._disk_checked = 0.0
+        self.disk_free_gb = None
+        self._write_failed = False
         self._last_status = 0.0
         self._last_live = 0.0
         self._status_broken = False
@@ -619,8 +802,34 @@ class Recorder:
     def open_control(self):
         self.link = self.make_visca_link()
         if self.link is None:
-            log.error("no VISCA port answered -- zoom control and zoom "
-                      "logging will be unavailable")
+            log.error("no VISCA port answered -- zoom and imaging mode are "
+                      "unavailable until it does; still looking every %gs",
+                      CONTROL_RETRY)
+            threading.Thread(target=self._find_control_later, daemon=True,
+                             name="visca-retry").start()
+
+    def _find_control_later(self):
+        """Keep looking for a control port that did not answer at startup.
+
+        Without this a camera that was slow to answer at launch -- a board
+        just powered up, or one holding replies from before -- left the whole
+        run with no zoom and no imaging mode. Once found, the servo is
+        started exactly as it would have been at launch.
+        """
+        attempts = 0
+        while self.running and self.link is None:
+            time.sleep(CONTROL_RETRY)
+            attempts += 1
+            link = self.make_visca_link()
+            if link is not None:
+                self.link = link
+                log.warning("VISCA: camera control found after %d retries", attempts)
+                self.start_servo()
+                return
+            if attempts % 6 == 0:
+                log.warning("VISCA: still no camera control (%d retries); if "
+                            "the camera board was unplugged or reset it may "
+                            "need its 12 V power cycled", attempts)
 
     def make_visca_link(self):
         """Find and open the camera's control port. None if it is not there.
@@ -632,46 +841,148 @@ class Recorder:
         """
         ports = [self.args.port] if self.args.port else None
         bauds = [self.args.baud] if self.args.baud else None
+        if ports is None and self.control_on_board:
+            # Coming back to a board found by USB ID: only its own ports.
+            # The full sweep would also probe the autopilot's -- every 2 s
+            # for as long as the camera is unplugged, writing VISCA into the
+            # MAVLink stream and reading telemetry out from under it.
+            ports = devices.camera_serial_ports()
+            if not ports:
+                return None
+            # And the baud it answered at: it is a camera register, not
+            # something a replug changes, and against a board that has
+            # stopped answering, every extra rate is another slow open.
+            if bauds is None and self.control_baud:
+                bauds = [self.control_baud]
         port, baud = devices.autodetect_visca(ports, bauds)
         if port is None:
             return None
+        link = None
         try:
             link = ViscaLink(port, baud, self.args.address)
             link.if_clear()
         except Exception as exc:
             log.warning("VISCA: %s at %d baud would not open: %s",
                         port, baud, exc)
+            # Closed here, or its exclusive lock outlives it and every later
+            # reconnect finds the port "locked by another process".
+            if link is not None:
+                try:
+                    link.close()
+                except Exception:
+                    pass
             return None
         self.control_port = port
+        self.control_on_board = (
+            devices.usb_id(port) in devices.CAMERA_BOARD_USB_IDS)
+        self.control_baud = baud
         log.info("VISCA: %s at %d baud", port, baud)
+        self.apply_stabilizer(link)
         return link
 
+    def apply_stabilizer(self, link):
+        """Put the camera's image stabilizer where --stabilizer asks.
+
+        Done for every new link -- startup, the retry after a camera that
+        did not answer at launch, and the servo's reconnects -- because the
+        setting lives in the camera and does not survive it losing power:
+        after the 12 V power cycles the Oppila board needs, the camera read
+        back "off". The Twiga NeoHD driver (neohd-ptz-ros) switched it on at
+        startup; this recorder never did, so the feed went unstabilised.
+
+        Read back afterwards rather than trusting the acknowledgement, and
+        never fatal: a recording without stabilisation still beats none.
+        """
+        wanted = getattr(self.args, "stabilizer", "on")
+        try:
+            if wanted != "keep":
+                link.command(visca.image_stabilizer(wanted == "on", link.address))
+            state = visca.parse_stabilizer(
+                link.inquiry(visca.stabilizer_inq(link.address)))
+        except Exception as exc:
+            log.warning("image stabilizer: could not %s: %s",
+                        "read it" if wanted == "keep" else "turn it %s" % wanted,
+                        exc)
+            return
+        if wanted == "keep":
+            log.info("image stabilizer: %s (as found -- --stabilizer keep)", state)
+        elif state == wanted:
+            log.info("image stabilizer: %s (confirmed by the camera)", state)
+        else:
+            log.warning("image stabilizer: asked for %s, camera reports %s",
+                        wanted, state)
+
     def open_mavlink(self):
+        if getattr(self.args, "no_mavlink", False):
+            log.info("--no-mavlink: not looking for a flight controller -- "
+                     "r starts a recording, x x stops it")
+            return
         url, baud = self.args.rc_url, self.args.rc_baud
         if url is None:
             log.info("probing for the flight controller...")
             url, baud = devices.autodetect_mavlink(exclude=self.control_port)
             if url is None:
-                log.error("no MAVLink heartbeat on any serial port -- no RC "
-                          "control, no telemetry. Pass --rc-url to pin it.")
+                log.critical("=" * 68)
+                log.critical("NO FLIGHT CONTROLLER FOUND -- ch%d CANNOT START "
+                             "A RECORDING.", self.args.rec_channel)
+                log.critical("Recording is armed by RC channel %d, which "
+                             "arrives over MAVLink. Without",
+                             self.args.rec_channel)
+                log.critical("it, press r in the pane to record (x x stops), "
+                             "or run with --autostart.")
+                log.critical("Zoom, imaging mode and snapshots still work. "
+                             "--no-mavlink skips all this.")
+                log.critical("Fix: check the autopilot's USB lead and that "
+                             "it is powered, or pass")
+                log.critical("--rc-url to pin the port. Pass "
+                             "--require-mavlink to make this fatal.")
+                log.critical("Still looking every %gs -- plug it in and it "
+                             "is picked up without a restart.", CONTROL_RETRY)
+                log.critical("=" * 68)
+                threading.Thread(target=self._find_mavlink_later, daemon=True,
+                                 name="mavlink-retry").start()
                 return
-        self.mavlink = MavlinkSource(
+        self._attach_mavlink(url, baud)
+
+    def _find_mavlink_later(self):
+        """Keep looking for an autopilot that was not there at startup.
+
+        Without this an autopilot plugged in -- or powered -- after the
+        recorder started meant ch8 did nothing for the rest of the run,
+        however long it went, until someone restarted it.
+        """
+        while self.running and self.mavlink is None:
+            time.sleep(CONTROL_RETRY)
+            url, baud = devices.autodetect_mavlink(exclude=self.control_port)
+            if url is not None:
+                self._attach_mavlink(url, baud)
+                log.warning("MAVLink: flight controller found -- ch%d now "
+                            "arms recording", self.args.rec_channel)
+                return
+
+    def _attach_mavlink(self, url, baud):
+        """Bring up MAVLink and everything read through it.
+
+        The switches are built before self.mavlink is set, because the
+        capture loop takes self.mavlink being there to mean all of it is.
+        """
+        mavlink = MavlinkSource(
             url=url, baud=baud, stream_rate_hz=self.args.stream_rate,
             on_status=lambda msg: log.info("MAVLink: %s", msg),
         )
         log.info("MAVLink: %s at %d baud, zoom on ch%d, record on ch%d",
                  url, baud, self.args.rc_channel, self.args.rec_channel)
-        self.rc = RcZoomSource(
+        rc = RcZoomSource(
             channel=self.args.rc_channel,
             pwm_min=self.args.rc_pwm_min, pwm_max=self.args.rc_pwm_max,
             pwm_deadband=self.args.rc_deadband, reverse=self.args.rc_reverse,
             rc_timeout=self.args.rc_timeout,
-            source=self.mavlink,
+            source=mavlink,
         )
 
         if self.args.snap_channel:
             self.snap_button = RcButton(
-                self.mavlink, self.args.snap_channel,
+                mavlink, self.args.snap_channel,
                 threshold=self.args.snap_threshold,
                 reverse=self.args.snap_reverse,
                 rc_timeout=self.args.rc_timeout,
@@ -683,7 +994,7 @@ class Recorder:
             # Low, centre, high -- in the order the switch travels, which is
             # the order the modes are listed in on the transmitter.
             self.icr_switch = RcSelector(
-                self.mavlink, self.args.icr_channel,
+                mavlink, self.args.icr_channel,
                 ["day", "night_color", "night"],
                 pwm_min=self.args.rc_pwm_min, pwm_max=self.args.rc_pwm_max,
                 reverse=self.args.icr_channel_reverse,
@@ -691,6 +1002,10 @@ class Recorder:
             )
             log.info("imaging mode: ch%d, low RGB / centre RGB+IR / high IR",
                      self.args.icr_channel)
+        self.rc = rc
+        if self.servo is not None and self.servo.rc is None:
+            self.servo.rc = rc      # the zoom knob, for an autopilot found late
+        self.mavlink = mavlink
 
     def start_servo(self):
         if self.link is None:
@@ -760,15 +1075,35 @@ class Recorder:
 
         width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # YUYV and UYVY arrive as the same two-channel shape when OpenCV
+        # does not convert, so the negotiated format is what tells them apart.
+        pixel_format = devices.fourcc_of(capture)
+        self.yuv_code = devices.yuv422_to_bgr_code(pixel_format)
         # What the camera says it runs at. Preferred over measuring, which
         # needs a second or two of frames to mean anything and is wrong if
         # recording starts before then.
         declared = capture.get(cv2.CAP_PROP_FPS)
         self.declared_fps = declared if 1.0 < declared < 1000.0 else None
-        log.info("video: %s at %dx%d, %s", device, width, height,
+        repeats = devices.usb_id(device) in devices.REPEATING_FRAME_USB_IDS
+        log.info("video: %s at %dx%d %s, %s", device, width, height,
+                 pixel_format or "format not reported",
                  f"{self.declared_fps:.2f} fps" if self.declared_fps
                  else "rate not reported")
-        self.grabber = FrameGrabber(capture)
+        self.repeating_board = repeats
+        if repeats:
+            # Its figure is not the camera's (devices.REPEATING_FRAME_USB_IDS),
+            # and tagging a recording with it would play it back at the wrong
+            # speed. The camera's own nominal rate (--fps) is used instead.
+            self.declared_fps = None
+            log.info("video: this board repeats frames and misreports its "
+                     "rate -- dropping the repeats and measuring the rate")
+        # Ask the backend to hand over BGR; _to_bgr covers it declining.
+        try:
+            capture.set(cv2.CAP_PROP_CONVERT_RGB, 1.0)
+        except Exception:
+            pass
+        self.grabber = FrameGrabber(capture, self.yuv_code,
+                                    drop_repeats=repeats)
         return True
 
     def reopen_camera(self):
@@ -787,15 +1122,19 @@ class Recorder:
                 pass
             self.grabber = None
 
-        # An in-progress recording cannot span the gap -- the frame stream
-        # it was built around is gone -- so close it out now. If the switch
-        # is still armed when frames return, run() opens a fresh segment.
+        # An mp4 cannot span a gap in its own frame stream, so this one is
+        # finalised now. The *flight* is not over: the CSV stays open, the
+        # telemetry track keeps being written, and frames returning open a
+        # new numbered segment against the same session.
         if self.video is not None:
-            log.warning("video: closing the current recording at the break")
-            self.stop_recording()
+            log.warning("video: closing segment %d at the break -- telemetry "
+                        "keeps recording", self.segment)
+            self.close_segment()
 
         if self.open_camera(quiet=True):
-            log.info("video: camera recovered")
+            # Opened is not recovered: a wedged board opens fine and then
+            # sends nothing. "frames flowing again" is the real recovery.
+            log.info("video: camera reopened -- waiting for frames")
             return True
         # Say so plainly. Nobody is watching the drone, so the pane and the
         # log are the only places a dead camera can announce itself.
@@ -821,6 +1160,14 @@ class Recorder:
         except (ViscaError, ViscaTimeout, ValueError) as exc:
             log.error("imaging mode: %s would not take: %s",
                       ICR_LABELS.get(mode, mode), exc)
+            return False
+        except Exception as exc:
+            # The link itself is gone (a closed or vanished port) -- the
+            # servo is already reconnecting, so this is said in one line
+            # rather than as a traceback per flick of the switch.
+            log.error("imaging mode: %s not set -- no camera control right "
+                      "now (%s); it reconnects by itself",
+                      ICR_LABELS.get(mode, mode), type(exc).__name__)
             return False
         self.icr_mode = mode
         log.info("%s: %s", announce, ICR_LABELS[mode])
@@ -897,6 +1244,171 @@ class Recorder:
         else:
             log.warning("zoom: no RC link to hand back to")
 
+    def request_start_recording(self, why="r in the pane"):
+        """Start a recording without the RC switch -- no Pixhawk needed.
+
+        For bench runs and for flying with no flight controller wired in,
+        where ch8 does not exist. The recording holds until x x, or until
+        ch8 (if there is one) is flicked up and back down; a switch that is
+        merely sitting low does not end it. Video joins on the next frame,
+        so this works with the camera still coming up.
+        """
+        if self.recording:
+            log.info("already recording")
+            return
+        if self._write_failed:
+            log.error("not starting: the last write failed (full disk?) -- "
+                      "free space and restart the recorder")
+            return
+        self._by_hand = True
+        self.start_recording(None)
+        log.info("recording started by %s -- stop it with r r (or x x)", why)
+
+    def request_stop_recording(self, key="x"):
+        """Stop the recording -- the only way a flight's footage ends.
+
+        Two presses, not one. This is the single irreversible key on a
+        terminal that anyone might lean on, and the whole point of moving
+        the stop off ch8 was that a recording should not end by accident.
+        """
+        if not self.recording:
+            log.info("not recording -- nothing to stop")
+            return
+        now = time.monotonic()
+        if now - self._stop_armed > STOP_CONFIRM_WINDOW:
+            self._stop_armed = now
+            log.warning("press %s again within %.0fs to STOP the recording",
+                        key, STOP_CONFIRM_WINDOW)
+            return
+        self._stop_armed = 0.0
+        base = self.base
+        # Suppress BEFORE stopping, not after. ch8 is almost certainly
+        # still high -- that is how the recording started -- and any gap
+        # between "no longer recording" and "not allowed to start" is a
+        # gap in which a new session begins and the stop key has merely
+        # chopped the flight in two.
+        still_high = self.wants_recording()
+        if still_high:
+            self._start_suppressed = True
+        self.stop_recording(why=f"{key} in the pane")
+        if still_high:
+            log.info("ch%d is still high; flick it low and back to start "
+                     "another recording", self.args.rec_channel)
+        # Ask now, while the pilot is still thinking about the flight they
+        # just made. A timestamp is a fine filename and a poor label, and
+        # ten minutes later nobody remembers which one was the good pass.
+        self.begin_name_entry(base)
+
+    # -- naming a finished flight ----------------------------------------
+
+    def begin_name_entry(self, base):
+        """Offer to rename the files a finished recording just produced."""
+        if base is None or not self.recorded_files(base):
+            return
+        if self.keys is None or not self.keys.enabled:
+            # No terminal to ask on -- a detached or piped run. The
+            # timestamp name stands, which is why it is the default.
+            return
+        self._name_base = base
+        self.name_entry = ""
+        self.show_name_entry()
+
+    def recorded_files(self, base):
+        """Every file that belongs to one recording session.
+
+        The video may be several numbered segments, so this globs rather
+        than assuming ".mp4" -- renaming only the first segment would
+        scatter one flight across two names.
+        """
+        stem = os.path.basename(base)
+        directory = os.path.dirname(base)
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            return []
+        out = []
+        for name in sorted(names):
+            if not name.startswith(stem):
+                continue
+            rest = name[len(stem):]
+            # "" + .mp4/.csv, or "-2" + .mp4 -- not "-something-else".
+            if re.fullmatch(r"(-\d+)?\.(%s|csv)" % "|".join(CONTAINERS), rest):
+                out.append(os.path.join(directory, name))
+        return out
+
+    def show_name_entry(self):
+        LIVE.show(f"name this flight> {self.name_entry}"
+                  f"   [Enter keeps {os.path.basename(self._name_base or '')}]")
+
+    def handle_name_entry(self, key):
+        if key in ("\r", "\n"):
+            text, self.name_entry = self.name_entry, None
+            base, self._name_base = self._name_base, None
+            if not text.strip():
+                log.info("kept the timestamp name: %s",
+                         os.path.basename(base or "?"))
+                return
+            self.rename_recording(base, text)
+            return
+        if key in ("\x7f", "\b"):
+            self.name_entry = self.name_entry[:-1]
+        elif key.isprintable() and len(self.name_entry) < 60:
+            self.name_entry += key
+        self.show_name_entry()
+
+    @staticmethod
+    def safe_name(text):
+        """A filename from whatever was typed, or None if nothing survives.
+
+        Takes the basename first, so a slash cannot walk the rename out of
+        the recordings directory, and keeps only characters that are
+        painless in a shell and on any filesystem.
+        """
+        text = os.path.basename(text.strip()).strip(". ")
+        text = re.sub(r"\s+", "_", text)
+        text = re.sub(r"[^A-Za-z0-9._-]", "", text)
+        return text or None
+
+    def rename_recording(self, base, text):
+        """Rename every file of one session, or none of them."""
+        name = self.safe_name(text)
+        if name is None:
+            log.warning("that name has no usable characters -- keeping %s",
+                        os.path.basename(base))
+            return
+        files = self.recorded_files(base)
+        if not files:
+            log.warning("nothing left to rename for %s",
+                        os.path.basename(base))
+            return
+
+        directory = os.path.dirname(base)
+        stem = os.path.basename(base)
+        # Never overwrite an existing recording, and never half-rename a
+        # session: a suffix is found that clears every file at once.
+        suffix, target = "", name
+        while True:
+            planned = [(f, os.path.join(
+                directory, target + os.path.basename(f)[len(stem):])) for f in files]
+            if not any(os.path.exists(dst) for _, dst in planned):
+                break
+            suffix = f"-{int(suffix[1:] or 1) + 1}" if suffix else "-2"
+            target = name + suffix
+        if suffix:
+            log.warning("%s was taken -- using %s", name, target)
+
+        for src, dst in planned:
+            try:
+                os.rename(src, dst)
+            except OSError as exc:
+                log.error("could not rename %s: %s -- the rest of this "
+                          "flight keeps its old name",
+                          os.path.basename(src), exc)
+                return
+        log.info("RENAMED  %s -> %s  (%d file(s))", stem, target, len(planned))
+        for _, dst in planned:
+            log.info("         %s", os.path.basename(dst))
+
     # -- snapshots -------------------------------------------------------
 
     def take_snapshot(self, why="ch%d"):
@@ -966,11 +1478,23 @@ class Recorder:
         if self.zoom_entry is not None:
             self.handle_zoom_entry(key)
             return
+        if self.name_entry is not None:
+            self.handle_name_entry(key)
+            return
 
         if key in ICR_BY_KEY:
             self.set_icr(ICR_BY_KEY[key])
         elif key in ("i", "I"):
             self.cycle_icr()
+        elif key in ("r", "R"):
+            # A toggle, so one key does both from the laptop. Stopping still
+            # takes two presses, exactly like x.
+            if self.recording:
+                self.request_stop_recording(key="r")
+            else:
+                self.request_start_recording()
+        elif key in ("x", "X"):
+            self.request_stop_recording()
         elif key in ("z", "Z"):
             self.begin_zoom_entry()
         elif key in ("a", "A"):
@@ -986,32 +1510,11 @@ class Recorder:
     # -- recording -------------------------------------------------------
 
     def start_recording(self, frame, captured_at=None):
-        height, width = frame.shape[:2]
-        # The container's frame rate decides playback speed, so it has to be
-        # right from the first frame. The camera's own figure is used where
-        # it has one; a measured rate is only trusted once enough frames
-        # have arrived for it to be meaningful.
-        measured = self.grabber.fps()
-        if self.declared_fps:
-            fps, source = self.declared_fps, "camera"
-        elif measured >= 1.0:
-            fps, source = measured, "measured"
-        else:
-            fps, source = self.args.fps, "--fps default"
-
+        """Begin a flight: open the CSV, then the first video segment."""
         os.makedirs(self.args.record_dir, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.base = os.path.join(self.args.record_dir, f"fcb-{stamp}")
-
-        try:
-            self.video = VideoRecorder(
-                f"{self.base}.mp4", width, height, fps,
-                encoder=self.args.encoder, bitrate_mbps=self.args.bitrate,
-            )
-        except RuntimeError as exc:
-            log.error("could not start recording: %s", exc)
-            self.base = None
-            return
+        self.base = _unique_base(
+            os.path.join(self.args.record_dir, f"fcb-{stamp}"))
 
         self.csv = TelemetryCsv(f"{self.base}.csv")
         # Time zero is the first frame that gets written, not the instant
@@ -1023,26 +1526,89 @@ class Recorder:
         self.record_started_wall = datetime.now(timezone.utc) - _delta(
             now_mono - self.record_started_mono
         )
-        log.info("RECORDING STARTED  %s.mp4 (%dx%d @ %.2f fps from %s, "
-                 "%s encoder)",
-                 os.path.basename(self.base), width, height, fps, source,
-                 self.video.encoder)
-        log.info("                   %s.csv", os.path.basename(self.base))
+        self.recording = True
+        self.segment = 0
+        self._last_gap_row = 0.0
+        log.info("RECORDING STARTED  %s.csv", os.path.basename(self.base))
+        self.open_segment(frame)
 
-    def stop_recording(self):
+    def open_segment(self, frame):
+        """Open one mp4 inside the current session.
+
+        Called again after a camera outage, so a flight that loses video
+        for a while comes back as a second numbered file rather than
+        ending. Returns True if there is a video to write to.
+        """
+        if frame is None or self.grabber is None:
+            return False
+        height, width = frame.shape[:2]
+        # The container's frame rate decides playback speed, so it has to be
+        # right from the first frame. The camera's own figure is used where
+        # it has one; a measured rate is only trusted once enough frames
+        # have arrived for it to be meaningful.
+        measured = self.grabber.fps()
+        if self.declared_fps:
+            fps, source = self.declared_fps, "camera"
+        elif self.repeating_board:
+            # Not measured: a measurement taken while the link is losing
+            # frames tagged one recording 43 fps for a 60 fps camera, so it
+            # played back at the wrong speed. The camera runs at its nominal
+            # rate; frames lost on the way are filled in (see write_frame).
+            fps, source = self.args.fps, "camera nominal"
+        elif measured >= 1.0:
+            fps, source = measured, "measured"
+        else:
+            fps, source = self.args.fps, "--fps default"
+
+        # This is retried on every frame while there is no video, so it is
+        # rate-limited, and the segment number only advances on success --
+        # it used to advance per attempt, numbering the file -57 after a
+        # second of failures and logging an error per frame.
+        now = time.monotonic()
+        if now - self._segment_failed_at < 5.0:
+            return False
+        number = self.segment + 1
+        suffix = "" if number == 1 else f"-{number}"
+        path = f"{self.base}{suffix}.{self.args.container}"
+        try:
+            self.video = VideoRecorder(
+                path, width, height, fps,
+                encoder=self.args.encoder, bitrate_mbps=self.args.bitrate,
+            )
+        except RuntimeError as exc:
+            # The flight is not over: telemetry keeps going without video.
+            self._segment_failed_at = now
+            log.error("could not open video segment %d (%s) -- telemetry "
+                      "keeps recording; retrying every 5s", number, exc)
+            self.video = None
+            return False
+        self.segment = number
+        self._last_written = None
+        self._last_written_at = None
+
+        self.video_path = path
+        log.info("  video segment %d: %s (%dx%d @ %.2f fps from %s, "
+                 "%s encoder)", self.segment, os.path.basename(path),
+                 width, height, fps, source, self.video.encoder)
+        return True
+
+    def close_segment(self):
+        """Finalise the current mp4, leaving the session and CSV open."""
         if self.video is None:
             return
         frames = self.video.frames
         encoder = self.video.encoder
+        path = self.video_path
         elapsed = self.video.close()
-        rows = self.csv.rows
-        self.csv.close()
-        size_bytes = os.path.getsize(f"{self.base}.mp4")
-        size_mb = size_bytes / 1e6
-        log.info("RECORDING STOPPED  %s.mp4 -- %d frames, %.1fs, %.1f MB "
-                 "(%.1f fps average), %d CSV rows",
-                 os.path.basename(self.base), frames, elapsed, size_mb,
-                 frames / elapsed if elapsed > 0 else 0.0, rows)
+        self.video = None
+        try:
+            size_bytes = os.path.getsize(path)
+        except OSError:
+            size_bytes = 0
+        log.info("  video segment %d closed: %s -- %d frames, %.1fs, "
+                 "%.1f MB (%.1f fps average)", self.segment,
+                 os.path.basename(path), frames, elapsed, size_bytes / 1e6,
+                 frames / elapsed if elapsed > 0 else 0.0)
 
         # Frames counted but nothing on disk means the encoder rejected
         # every buffer. That failure is otherwise completely silent -- the
@@ -1057,13 +1623,75 @@ class Recorder:
                 "encoder problem is investigated.",
                 size_bytes, frames, encoder,
             )
-        self.video = None
+
+    def stop_recording(self, why="stopped"):
+        """End the flight: close the last video segment and the CSV.
+
+        Called for ch8 going low (once it has held there for --rec-debounce,
+        see settled_switch), for x in the pane, on a write failure, and at
+        shutdown. A range dropout does not stop it: stale RC reads as "cannot
+        tell", which holds whatever is happening.
+        """
+        if not self.recording:
+            return
+        # Marked stopped first, so nothing writes to half-closed files, and
+        # each close is attempted whatever happened to the other -- a full
+        # disk can make the CSV's final flush fail too.
+        self.recording = False
+        self._by_hand = False
+        try:
+            self.close_segment()
+        except Exception:
+            log.exception("could not close the video cleanly")
+            self.video = None
+        rows = self.csv.rows if self.csv is not None else 0
+        if self.csv is not None:
+            try:
+                self.csv.close()
+            except Exception as exc:
+                log.error("could not close the CSV cleanly: %s", exc)
         self.csv = None
+        elapsed = (time.monotonic() - self.record_started_mono
+                   if self.record_started_mono else 0.0)
+        log.info("RECORDING STOPPED (%s)  %s -- %.1fs, %d video segment(s), "
+                 "%d telemetry rows", why, os.path.basename(self.base or "?"),
+                 elapsed, self.segment, rows)
+
+    def write_gap_row(self, now):
+        """A telemetry row with no frame behind it.
+
+        Video and telemetry are two records of the same flight and must not
+        take each other down. The camera dropping out used to end the CSV
+        as well, losing the position track for the rest of the sortie --
+        the half of the data that is hardest to fly again. These rows carry
+        an empty frame number, which is how you tell them apart afterwards.
+        """
+        if self.csv is None or self.record_started_mono is None:
+            return
+        if now - self._last_gap_row < self.args.telemetry_interval:
+            return
+        self._last_gap_row = now
+        t_mono = now - self.record_started_mono
+        try:
+            self.csv.write(
+                None, self.record_started_wall + _delta(t_mono), t_mono,
+                self.mavlink.telemetry() if self.mavlink else _NO_TELEMETRY,
+                self.servo if self.servo else _NO_ZOOM, now,
+            )
+        except Exception:
+            log.exception("telemetry row failed; continuing")
 
     def wants_recording(self):
-        """Whether the RC switch is asking for recording right now."""
+        """Whether the RC switch is asking for recording right now.
+
+        None means "cannot tell", and no flight controller is exactly that
+        -- not a considered "no". The difference matters: returning False
+        here made the capture loop treat an unanswerable question as a
+        settled answer, so it recorded nothing and never said why. A whole
+        flight was lost to that.
+        """
         if self.mavlink is None:
-            return False
+            return None
         age = self.mavlink.rc_age()
         if age is None or age > self.args.rc_timeout:
             return None  # unknown -- RC is stale, hold whatever we are doing
@@ -1095,8 +1723,8 @@ class Recorder:
 
     def announce_keys(self):
         if self.keys is not None and self.keys.enabled:
-            log.info("keys: %s  i cycle  s snap  z zoom to an exact value  "
-                     "a knob back  ? status  (Ctrl-C stops)",
+            log.info("keys: %s  i cycle  s snap  z zoom  a knob back  "
+                     "r REC/STOP (r r)  x STOP+NAME (twice)  ? status  (Ctrl-C quits)",
                      "  ".join(f"{key} {name}" for key, name, _, _ in ICR_MODES))
         else:
             log.info("stdin is not a terminal -- no keyboard, so the imaging "
@@ -1116,7 +1744,13 @@ class Recorder:
         if self.keys is None:
             return
         try:
-            while self.keys.pending():
+            # Bounded. Draining is meant to clear a burst of typing, and no
+            # human produces more than a handful between frames; an
+            # unbounded loop here is one broken descriptor away from
+            # holding the capture loop for ever.
+            for _ in range(64):
+                if not self.keys.pending():
+                    break
                 key = self.keys.get()
                 if key is not None:
                     self.handle_key(key)
@@ -1125,7 +1759,7 @@ class Recorder:
 
     def capture_loop(self):
         last_seq = 0
-        last_rc_warning = 0.0
+        self._last_rc_warning = 0.0
         waiting_logged = False
         last_frame_at = time.monotonic()
 
@@ -1150,17 +1784,41 @@ class Recorder:
                     waiting_logged = True
                 # Give the stream a grace period, then rebuild it. Without
                 # this a camera that drops out stays dropped out and the
-                # rest of the flight records nothing.
-                if now - last_frame_at > self.args.camera_timeout:
+                # rest of the flight records nothing. Backing off, though:
+                # 5 s, 10, 20, 40, then every 60 s. A reopen cannot revive a
+                # board that has stopped streaming (the Oppila one needs its
+                # 12 V cycled), and the open/close churn of retrying every
+                # 5 s for ever is itself what wedges it.
+                wait = min(60.0, self.args.camera_timeout * (2 ** min(self._reopens, 4)))
+                if now - last_frame_at > wait:
+                    self._reopens += 1
                     if self.reopen_camera():
                         last_seq = 0
+                    if self._reopens >= 2:
+                        self.board_is_stuck("no frames after %d reopens" % self._reopens)
+                    if self._reopens >= 3:
+                        log.warning("video: %d reopens without a frame -- next "
+                                    "try in %.0fs. If the camera board was "
+                                    "unplugged or reset, cycle its 12 V supply",
+                                    self._reopens, min(60.0, self.args.camera_timeout
+                                                       * (2 ** min(self._reopens, 4))))
                     last_frame_at = time.monotonic()
+                # No video does not mean no flight: the switch is still
+                # obeyed, and the position and attitude track keeps going.
+                self.apply_record_switch(now, None, None)
+                if self.recording:
+                    self.write_gap_row(now)
+                self.check_disk(now)
                 self.update_display(now)
                 continue
             last_frame_at = now
+            self._reopens = 0
+            frame = _to_bgr(frame, self.yuv_code)
             if waiting_logged:
                 log.info("frames flowing again")
                 waiting_logged = False
+            self.check_blank(frame, now)
+            self.check_disk(now)
 
             if self.frames_seen == 0:
                 log.info("first frame received (%dx%d)",
@@ -1177,30 +1835,255 @@ class Recorder:
             self.last_frame = frame
             self.poll_rc_switches()
 
-            wanted = self.wants_recording()
-            if wanted is None:
-                if now - last_rc_warning > 5.0:
-                    log.warning("no RC data -- holding recording state")
-                    last_rc_warning = now
-            elif wanted and self.video is None:
-                self.start_recording(frame, captured_at)
-            elif not wanted and self.video is not None:
-                self.stop_recording()
+            self.apply_record_switch(now, frame, captured_at)
 
-            if self.video is not None:
-                frame_number = self.video.frames
-                self.video.write(frame)
-                wall = self.record_started_wall + _delta(
-                    captured_at - self.record_started_mono
-                )
-                self.csv.write(
-                    frame_number, wall, captured_at - self.record_started_mono,
-                    self.mavlink.telemetry() if self.mavlink else _NO_TELEMETRY,
-                    self.servo if self.servo else _NO_ZOOM,
-                    now,
-                )
+            if self.recording:
+                # Video coming back mid-flight rejoins the same session as
+                # a new numbered segment, against the same CSV.
+                if self.video is None:
+                    self.open_segment(frame)
+                # Read both once. A stop that lands between the check and
+                # the write would otherwise dereference a closed CSV --
+                # unreachable while keys are handled inside this loop, but
+                # this is the only copy of a flight and the guard is free.
+                video, sheet = self.video, self.csv
+                if video is not None and sheet is not None:
+                    try:
+                        self.write_frame(video, sheet, frame, captured_at, now,
+                                         seq_gap=max(1, dropped + 1))
+                    except Exception as exc:
+                        self.on_write_failure(exc)
+                else:
+                    self.write_gap_row(now)
 
             self.update_display(now)
+
+    def write_frame(self, video, sheet, frame, captured_at, now, seq_gap=1):
+        """Write one captured frame, after filling a gap the camera left.
+
+        A frame the camera link lost leaves a hole in the timeline, and the
+        container plays at a fixed rate, so without a fill the video runs
+        short and plays fast. Only those holes are filled -- seq_gap == 1,
+        the grabber had nothing in between -- each judged on its own against
+        the frame before it, and never more than MAX_FILL_PER_GAP at once.
+
+        The first version kept a running total against the segment's start
+        and filled whatever it said was missing, including frames this loop
+        had merely been too slow to collect. Every fill costs an encode, the
+        cost made the next frame late, and it spiralled: 291 real frames and
+        1,795 copies in a 35 s recording. Frames skipped here are counted in
+        frames_dropped instead, as before.
+        """
+        telemetry = self.mavlink.telemetry() if self.mavlink else _NO_TELEMETRY
+        servo = self.servo if self.servo else _NO_ZOOM
+        prev, prev_t = self._last_written, self._last_written_at
+        if prev is not None and seq_gap == 1 and prev_t is not None:
+            gap = captured_at - prev_t
+            # Over 1.75 frame periods: the board's own arrival jitter (frames
+            # 10-27 ms apart around a 16.7 ms mean) never reaches that.
+            if gap > 1.75 / video.fps:
+                missing = min(int(round(gap * video.fps)) - 1,
+                              self.MAX_FILL_PER_GAP)
+                for i in range(1, missing + 1):
+                    t = prev_t + i / video.fps
+                    sheet.write(video.frames,
+                                self.record_started_wall + _delta(t - self.record_started_mono),
+                                t - self.record_started_mono, telemetry, servo, now,
+                                filled=1)
+                    video.write(prev)
+        sheet.write(video.frames,
+                    self.record_started_wall + _delta(captured_at - self.record_started_mono),
+                    captured_at - self.record_started_mono, telemetry, servo, now)
+        video.write(frame)
+        self._last_written, self._last_written_at = frame, captured_at
+
+    def settled_switch(self, now):
+        """wants_recording(), acted on only once it has held still.
+
+        A single stray reading used to be enough: one low sample ended a
+        recording and the next high one began another, which is where the
+        one-frame recordings came from. The reading has to hold for
+        --rec-debounce seconds before it counts; until then the last settled
+        answer stands. "Cannot tell" (None) is passed straight through, as
+        it always meant "hold".
+        """
+        raw = self.wants_recording()
+        if raw is None:
+            self._switch_raw = None
+            return None
+        if raw != self._switch_raw:
+            self._switch_raw, self._switch_since = raw, now
+        if now - self._switch_since >= getattr(self.args, "rec_debounce", 0.3):
+            self._switch_settled = raw
+        return self._switch_settled
+
+    def apply_record_switch(self, now, frame, captured_at):
+        """Start or stop on ch8, with or without a video frame in hand.
+
+        Done on every turn of the loop, not only when a frame arrives: with
+        the camera out, flipping ch8 used to do nothing at all -- no
+        telemetry-only recording on the way up, no stop on the way down.
+        """
+        wanted = self.settled_switch(now)
+        if wanted is None:
+            if now - self._last_rc_warning > 5.0:
+                if self.mavlink is None:
+                    # Nothing to say when it is not wanted, or when a
+                    # recording started by hand is running fine without it.
+                    if not (getattr(self.args, "no_mavlink", False)
+                            or self.recording):
+                        log.error("NO FLIGHT CONTROLLER -- channel %d cannot "
+                                  "be read, so nothing is being recorded. "
+                                  "Press r to record without it. Still "
+                                  "looking; check the autopilot's USB lead "
+                                  "and power.", self.args.rec_channel)
+                elif self._switch_raw is None:
+                    log.warning("no RC data -- holding recording state")
+                self._last_rc_warning = now
+            return
+        if not wanted:
+            # The switch is genuinely low: whatever was stopped by hand is
+            # now stopped by the pilot too, so let it arm again.
+            if self._start_suppressed:
+                log.info("ch%d is low again -- the switch can start a new "
+                         "recording", self.args.rec_channel)
+                self._start_suppressed = False
+            if self.recording and self._by_hand:
+                return  # started without the switch; it has not been used
+            if self.recording:
+                # Deliberately no naming prompt here. That prompt swallows
+                # every keystroke until it is answered, and this path fires
+                # mid-flight with nobody necessarily at the keyboard -- it
+                # would leave the mode and snapshot keys dead. Name it with
+                # 'x', or afterwards.
+                self.stop_recording(why=f"ch{self.args.rec_channel} low")
+            return
+        # The switch is up: from here on it owns the recording, so bringing
+        # it back down stops one that was started by hand.
+        self._by_hand = False
+        if not self.recording and not self._start_suppressed:
+            if self._write_failed:
+                return  # said once already, in on_write_failure
+            self.start_recording(frame, captured_at)
+            if frame is None:
+                log.warning("recording with NO VIDEO yet -- telemetry is being "
+                            "written, and video joins as soon as frames arrive")
+
+    def on_write_failure(self, exc):
+        """A frame or row could not be written: say so, and stop cleanly.
+
+        Almost always a full disk. Left to propagate, it unwound the capture
+        loop and killed the recorder mid-flight; stopping here at least
+        closes the files that were written, so they stay readable. No new
+        recording starts until the recorder is restarted -- one that cannot
+        be written is not a recording.
+        """
+        free = self.free_gb()
+        log.critical("WRITE FAILED: %s -- %s. Stopping the recording so what "
+                     "was written stays readable.", exc,
+                     f"{free:.1f} GB free" if free is not None else
+                     "free space unknown")
+        self._write_failed = True
+        try:
+            self.stop_recording(why="write failed")
+        except Exception:
+            log.exception("could not close the recording cleanly")
+
+    def free_gb(self):
+        try:
+            return shutil.disk_usage(self.args.record_dir).free / 1e9
+        except (OSError, AttributeError):
+            return None
+
+    def check_disk(self, now):
+        """Warn as the recordings disk fills, every 30 s while it is low."""
+        if now - self._disk_checked < 30.0:
+            return
+        self._disk_checked = now
+        self.disk_free_gb = self.free_gb()
+        if self.disk_free_gb is None:
+            return
+        if self.disk_free_gb < 1.0:
+            log.critical("DISK NEARLY FULL: %.1f GB left in %s -- about %.0f s "
+                         "of video", self.disk_free_gb, self.args.record_dir,
+                         self.disk_free_gb * 1e9 / (getattr(self.args, 'bitrate', 25.0) * 1e6 / 8))
+        elif self.disk_free_gb < 5.0:
+            log.warning("disk low: %.1f GB left in %s (about %.0f min of video)",
+                        self.disk_free_gb, self.args.record_dir,
+                        self.disk_free_gb * 1e9 / (getattr(self.args, 'bitrate', 25.0) * 1e6 / 8) / 60)
+
+    def board_is_stuck(self, why):
+        """The board's video is wedged: power-cycle it if we can, else say so.
+
+        The Oppila board runs on its own 12 V, so it stays up while the Orin
+        boots or reboots -- and from its side that is the USB cable being
+        pulled, which it does not recover from (Oppila's docs; reproduced 5
+        Oct: after an Orin reboot the board never came back on USB at all,
+        and after a cold start of the whole drone it streamed 0 fps). Only
+        cutting its 12 V clears it. With --board-power-cycle-cmd set (a
+        relay or MOSFET on that 12 V line, driven by the Orin) the recorder
+        does it itself; at most once every 90 s, so a board that will not
+        come back is not cycled for ever.
+        """
+        cmd = getattr(self.args, "board_power_cycle_cmd", "")
+        now = time.monotonic()
+        if not cmd:
+            if not self._board_advice_given:
+                self._board_advice_given = True
+                log.error("CAMERA BOARD IS STUCK (%s). Cycle its 12 V supply. It "
+                          "does not recover from the Orin booting or rebooting "
+                          "while it stays powered; set --board-power-cycle-cmd "
+                          "to have the recorder do this itself.", why)
+            return
+        if now - self._board_cycled_at < 90.0:
+            return
+        self._board_cycled_at = now
+        log.warning("CAMERA BOARD IS STUCK (%s) -- power-cycling it: %s", why, cmd)
+        try:
+            done = subprocess.run(cmd, shell=True, timeout=60,
+                                  capture_output=True, text=True)
+            if done.returncode != 0:
+                log.error("board power cycle failed (exit %d): %s",
+                          done.returncode, (done.stderr or done.stdout).strip()[:200])
+        except Exception as exc:
+            log.error("board power cycle failed: %s", exc)
+        self._reopens = 0
+        self._blank_since = None
+
+    def check_blank(self, frame, now):
+        """Notice a picture that is one flat colour, every couple of seconds.
+
+        An all-green frame is the board streaming nothing but zeros: the
+        board is up and on USB, VISCA still answers (zoom and RGB/IR keep
+        working), but no image is reaching it from the camera block. It
+        looked like a working feed and recorded green; now it is said.
+        A real picture -- even pitch dark or lens-capped -- carries sensor
+        noise, so a spread of under one grey level means nothing is there.
+        """
+        if now - self._blank_checked < 2.0:
+            return
+        self._blank_checked = now
+        try:
+            blank = float(frame[::24, ::24].std()) < 1.0
+        except Exception:
+            return
+        if blank:
+            if self._blank_since is None:
+                self._blank_since = now
+            elif now - self._blank_since > 10.0:
+                self.board_is_stuck("picture blank for %.0fs" % (now - self._blank_since))
+        else:
+            self._blank_since = None
+        if blank and not self.picture_blank:
+            log.error("PICTURE IS BLANK -- every pixel the same colour (all "
+                      "green means all-zero frames). The board is streaming "
+                      "but receiving no image from the camera: check the "
+                      "camera's LVDS cable and power, then cycle the board's "
+                      "12 V. Zoom and RGB/IR still respond; that is a "
+                      "separate path.")
+        elif not blank and self.picture_blank:
+            log.info("picture is back")
+        self.picture_blank = blank
 
     def publish_state(self, text):
         """Write the full status line where other processes can read it.
@@ -1249,6 +2132,8 @@ class Recorder:
                 # gets the real status, so the GCS panes are unaffected.
                 if self.zoom_entry is not None:
                     self.show_zoom_entry()
+                elif self.name_entry is not None:
+                    self.show_name_entry()
                 else:
                     LIVE.show(text)
                 self.publish_state(text)
@@ -1267,10 +2152,18 @@ class Recorder:
         if self.frames_dropped:
             parts.append(f"skipped {self.frames_dropped}")
 
-        if self.video is not None:
+        if self.recording:
             elapsed = now - self.record_started_mono
-            parts.append(f"REC {os.path.basename(self.base)}.mp4 "
-                         f"({self.video.frames} fr, {elapsed:.0f}s)")
+            if self.video is not None:
+                parts.append(f"REC {os.path.basename(self.base)} "
+                             f"(seg {self.segment}, {self.video.frames} fr, "
+                             f"{elapsed:.0f}s)")
+            else:
+                # Still a live recording -- the telemetry track is being
+                # written. Saying "not recording" here would read as data
+                # loss when there is none.
+                parts.append(f"REC TELEMETRY ONLY -- NO VIDEO "
+                             f"({elapsed:.0f}s)")
         else:
             parts.append("not recording")
 
@@ -1289,6 +2182,18 @@ class Recorder:
             if self.servo.source != "rc":
                 zoom += " BY HAND"
             parts.append(zoom)
+
+        # First, and every quarter second, for as long as it is true. The
+        # one startup error scrolls off in seconds; this cannot.
+        if self.mavlink is None and not getattr(self.args, "no_mavlink", False):
+            parts.insert(0, "NO FC" if self.recording
+                         else "NO FC -- r TO RECORD")
+        if self.picture_blank and self.grabber is not None:
+            parts.insert(0, "BLANK PICTURE")
+        if self._write_failed:
+            parts.insert(0, "WRITE FAILED -- NOT RECORDING")
+        if self.disk_free_gb is not None and self.disk_free_gb < 5.0:
+            parts.append(f"DISK {self.disk_free_gb:.1f}GB")
 
         if self.icr_mode is not None:
             parts.append(ICR_SHORT[self.icr_mode])
@@ -1391,6 +2296,13 @@ def parse_args():
                              "0.5x detent an equal slice of knob travel; log "
                              "feels more like a camera rocker but crowds 20 "
                              "detents into the top 12%% of the knob)")
+    parser.add_argument("--stabilizer", default="on",
+                        choices=["on", "off", "keep"],
+                        help="the camera's image stabilizer, set every time "
+                             "the camera is connected (default on, as the "
+                             "Twiga NeoHD driver did). The camera comes back "
+                             "with it off after losing power. keep = leave "
+                             "it as found.")
     parser.add_argument("--icr", default=None, choices=list(ICR_BY_NAME),
                         help="imaging mode to start in: rgb (daylight "
                              "colour), ir (IR-sensitive mono), rgb+ir (IR "
@@ -1398,7 +2310,10 @@ def parse_args():
                              "in whatever mode it is already in. Switchable "
                              "while running with keys 1-4.")
     parser.add_argument("--record-dir",
-                        default=os.path.expanduser("~/fcb_recordings"))
+                        default=os.path.expanduser(
+                            os.environ.get("FCB_RECORD_DIR", "~/flight_recordings")),
+                        help="where recordings, snapshots and logs go "
+                             "(default $FCB_RECORD_DIR, else ~/flight_recordings)")
     parser.add_argument("--encoder", default="nvenc",
                         choices=("nvenc", "cpu"),
                         help="nvenc uses the Jetson's hardware encoder via "
@@ -1467,6 +2382,46 @@ def parse_args():
                         help="PWM at or above this is the 'record' position")
     parser.add_argument("--rec-channel-reverse", action="store_true",
                         help="treat low PWM as the 'record' position")
+    parser.add_argument("--board-power-cycle-cmd",
+                        default=os.environ.get("FCB_BOARD_POWER_CYCLE", ""),
+                        help="shell command that power-cycles the camera "
+                             "board's 12 V (e.g. drives a relay from a GPIO). "
+                             "Run when its video is stuck -- it does not "
+                             "recover from the Orin booting while it stays "
+                             "powered. Default $FCB_BOARD_POWER_CYCLE; empty "
+                             "means just say so.")
+    parser.add_argument("--rec-debounce", type=float, default=0.3,
+                        help="seconds ch8 must hold a new position before it "
+                             "starts or stops a recording (default: 0.3), so "
+                             "a single glitched reading cannot")
+    parser.add_argument("--container", default="avi",
+                        choices=sorted(CONTAINERS),
+                        help="video container (default: avi). AVI is the "
+                             "default because a truncated mp4 loses every "
+                             "frame -- its index lives at the end -- while a "
+                             "truncated AVI is still mostly readable.")
+    parser.add_argument("--telemetry-interval", type=float, default=0.1,
+                        help="seconds between telemetry rows written while "
+                             "there is no video (default: 0.1, i.e. 10 Hz). "
+                             "Frame-backed rows are unaffected -- they are "
+                             "written one per frame as before.")
+    parser.add_argument("--no-mavlink", action="store_true",
+                        help="run without a flight controller (Pixhawk): do "
+                             "not look for one or warn about it. Start "
+                             "recordings with r in the pane (x x stops), or "
+                             "use --autostart. The CSV then has no position "
+                             "or attitude.")
+    parser.add_argument("--autostart", action="store_true",
+                        help="start recording as soon as the recorder is up, "
+                             "without waiting for ch8 -- for runs with no "
+                             "Pixhawk or nobody at the keyboard. Stops on x x, "
+                             "or on ch8 flicked up and back down.")
+    parser.add_argument("--require-mavlink", action="store_true",
+                        help="refuse to start without a flight controller. "
+                             "Off by default, because the camera, zoom, "
+                             "imaging modes and snapshots all work without "
+                             "one; turn it on for a real flight, where a "
+                             "recorder that cannot arm is useless.")
 
     parser.add_argument("--status-interval", type=float, default=0.25,
                         help="seconds between live status refreshes on the "
@@ -1487,6 +2442,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.no_mavlink and args.require_mavlink:
+        sys.exit("--no-mavlink and --require-mavlink contradict each other")
     log_path = setup_logging(args.record_dir, args.log_level, args.quiet)
 
     log.info("fcb_record starting -- recordings and logs in %s",
@@ -1504,17 +2461,46 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
 
+    # An SSH session that dies of range sends SIGHUP to what was attached
+    # to it, and the default action is to die immediately -- which would
+    # leave the mp4 without its moov atom, i.e. unplayable, at exactly the
+    # moment a flight ends badly. tmux normally shields the recorder from
+    # this, but "normally" is not good enough for the only copy of a
+    # flight, so the signal is ignored outright: a dropped link is not a
+    # request to stop recording, and every deliberate way to stop is still
+    # there (x in the pane, ./fly.sh --stop, SIGTERM).
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
     try:
         # Control before video: the grab thread streams 1080p continuously
         # over the same USB3 link the NeoHD board carries VISCA on, and
         # probing baud rates against a busy bus makes the handshake flaky.
         recorder.open_control()
         recorder.open_mavlink()
+        if recorder.mavlink is None and args.require_mavlink:
+            log.critical("--require-mavlink was given and there is no flight "
+                         "controller, so this run would record nothing. "
+                         "Refusing to start.")
+            return 2
         recorder.start_servo()
         if not recorder.open_camera():
-            return 1
-        log.info("ready -- channel %d high starts recording",
-                 args.rec_channel)
+            # Not fatal. Exiting here only had the supervisor restart it
+            # every few seconds -- churn the board does not survive -- while
+            # recording nothing, not even telemetry. The loop keeps trying.
+            log.error("no camera at startup -- carrying on: ch8 still records "
+                      "telemetry, and video joins when the camera appears")
+        if args.no_mavlink:
+            log.info("ready -- no flight controller in use: r starts "
+                     "recording, x x stops it")
+        elif recorder.mavlink is None:
+            log.error("ready -- NO FLIGHT CONTROLLER: channel %d cannot start "
+                      "a recording until one is found. Press r to record "
+                      "without it.", args.rec_channel)
+        else:
+            log.info("ready -- channel %d high starts recording, or press r",
+                     args.rec_channel)
+        if args.autostart:
+            recorder.request_start_recording(why="--autostart")
         recorder.run()
     except Exception:
         log.exception("unhandled error")

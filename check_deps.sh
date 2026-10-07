@@ -7,6 +7,7 @@
 set -uo pipefail
 
 PYTHON="${FCB_PYTHON:-python3}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FAIL=0
 WARN=0
 
@@ -17,8 +18,8 @@ bad()  { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAIL=$((FAIL+1)); }
 echo "checking dependencies with $PYTHON ($($PYTHON -V 2>&1))"
 
 # -- python packages ---------------------------------------------------
-if $PYTHON -c 'import cv2' 2>/dev/null; then
-    ok "opencv $($PYTHON -c 'import cv2; print(cv2.__version__)' 2>/dev/null)"
+if PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" $PYTHON -c 'import prefer_cv2, cv2' 2>/dev/null; then
+    ok "opencv $(PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" $PYTHON -c 'import prefer_cv2, cv2; print(cv2.__version__)' 2>/dev/null)"
 else
     bad "opencv (cv2) not importable
         On a Jetson, OpenCV comes from JetPack and lives in the system
@@ -45,15 +46,15 @@ fi
 # The camera only offers raw 1080p60 YUYV, about 250 MB/s. Software
 # encoding that on an Orin drops frames, so NVENC is what makes the
 # default settings work.
-if $PYTHON -c 'import cv2' 2>/dev/null; then
-    if $PYTHON -c 'import cv2,sys; sys.exit(0 if "GStreamer:                   YES" in cv2.getBuildInformation() or "GStreamer:" in cv2.getBuildInformation() and "YES" in [l for l in cv2.getBuildInformation().splitlines() if "GStreamer:" in l][0] else 1)' 2>/dev/null; then
+if PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" $PYTHON -c 'import prefer_cv2, cv2' 2>/dev/null; then
+    if PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" $PYTHON -c 'import prefer_cv2, cv2,sys; sys.exit(0 if "GStreamer:                   YES" in cv2.getBuildInformation() or "GStreamer:" in cv2.getBuildInformation() and "YES" in [l for l in cv2.getBuildInformation().splitlines() if "GStreamer:" in l][0] else 1)' 2>/dev/null; then
         ok "opencv has GStreamer (NVENC path available)"
     else
         warn "opencv was built WITHOUT GStreamer -- NVENC is unavailable and
         the recorder will fall back to CPU mp4v, which will drop frames at
         1080p60. On a Jetson this usually means you are using a pip-installed
         opencv instead of JetPack's. Check with:
-          $PYTHON -c 'import cv2; print(cv2.getBuildInformation())' | grep -i gstreamer"
+          PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" $PYTHON -c 'import prefer_cv2, cv2; print(cv2.getBuildInformation())' | grep -i gstreamer"
     fi
 fi
 
@@ -132,22 +133,33 @@ shopt -u nullglob
     || warn "no /dev/ttyACM*, ttyUSB* or ttyTHS* -- camera control and the
         flight controller link will both be unavailable"
 
+# A warning, not a refusal: the recorder now runs without a camera --
+# ch8 still records telemetry, and video joins when the camera appears --
+# so refusing to start would only lose the telemetry too.
 [[ ${#video_nodes[@]} -gt 0 ]] \
     && ok "video nodes present: ${video_nodes[*]}" \
-    || bad "no /dev/video* at all -- the camera is not attached"
+    || warn "no /dev/video* at all -- the camera is not attached. The
+        recorder will still start and record telemetry on ch8; video joins
+        when the camera appears"
 
-if command -v v4l2-ctl >/dev/null 2>&1; then
-    cameras="$(v4l2-ctl --list-devices 2>/dev/null || true)"
-    if grep -qiE 'neohd|fcb|harrier' <<<"$cameras"; then
-        ok "an FCB/NeoHD camera is attached"
-    else
-        warn "no camera matching neohd/fcb/harrier is attached; the recorder
-        will refuse to start rather than record from the wrong camera"
-    fi
+# The recorder's own detection, so this cannot disagree with it -- it
+# matters for the NeoHD board, which sometimes comes up under a generic
+# "FX3 CAMERA" name that no name match would recognise. Status 2 here is
+# v4l2-ctl answering too slowly; it being missing is reported above.
+if command -v v4l2-ctl >/dev/null 2>&1 && PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}" $PYTHON -c 'import prefer_cv2, cv2' 2>/dev/null; then
+    camera="$(cd "$HERE" && $PYTHON -m fcb_base_driver.devices 2>&1)"
+    case $? in
+        0)  ok "camera: $(head -n 1 <<<"$camera")"
+            note="$(tail -n +2 <<<"$camera")"
+            [[ -n "$note" ]] && warn "the camera board $note" ;;
+        1)  warn "no known camera board is attached; the recorder will refuse
+        to start rather than record from the wrong camera" ;;
+        *)  warn "$camera" ;;
+    esac
 fi
 
 # -- writable output ---------------------------------------------------
-RECORD_DIR="${FCB_RECORD_DIR:-$HOME/fcb_recordings}"
+RECORD_DIR="${FCB_RECORD_DIR:-$HOME/flight_recordings}"
 mkdir -p "$RECORD_DIR" 2>/dev/null
 if [[ -w "$RECORD_DIR" ]]; then
     free_gb=$(df -BG --output=avail "$RECORD_DIR" 2>/dev/null | tail -1 | tr -dc '0-9')

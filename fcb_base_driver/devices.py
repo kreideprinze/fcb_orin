@@ -8,8 +8,10 @@ nothing here trusts a fixed path: a device is identified by answering its
 own protocol, or by the name v4l2 reports for it.
 """
 import glob
+import os
 import subprocess
 import sys
+from pathlib import Path
 
 import cv2
 
@@ -22,10 +24,53 @@ from fcb_base_driver.visca_link import ViscaLink
 #: particular camera turned out to be on reports "NeoHD".
 FCB_NAME_HINTS = ("neohd", "fcb", "harrier")
 
+#: USB interface boards that carry the FCB, by USB ID.
+#:
+#: The Twiga "USB3 NeoHD" board reports 04b4:00f9, or 04b4:00f8 when its
+#: link falls back to USB 2 (per github.com/gun29may/sony_fcb-ui).
+#:
+#: The Oppila LVDS-USB3 board (oppila.in/products/usb-interface) reports
+#: 04b4:0040 under the bare name "FX3 CAMERA", sends UYVY only, and has two
+#: ACM ports: interface 0 carries VISCA at 9600 baud, the other is debug
+#: output from its USB controller (Oppila's Getting Started and Camera
+#: Control pages). A name that generic says nothing about which camera it
+#: is, so boards are matched by USB ID rather than by adding "fx3" to the
+#: name hints, which would claim any FX3-based device on the bus.
+CAMERA_BOARD_USB_IDS = {
+    "04b4:00f9": "NeoHD",
+    "04b4:00f8": "NeoHD (USB 2 fallback)",
+    "04b4:0040": "Oppila LVDS-USB3",
+}
+
+#: The CDC-ACM interface that carries VISCA, where the board documents it.
+#: Oppila: interface 0 is VISCA, the other is the board's debug output.
+VISCA_INTERFACE = {"04b4:0040": 0}
+
+#: Boards whose serial bridge holds VISCA replies back until it has a full
+#: 32-byte USB packet of them; ViscaLink pads to push them out.
+CHUNKED_REPLY_USB_IDS = {"04b4:0040"}
+
+#: Boards that send some camera frames twice and report a frame rate that
+#: is not the camera's. The Oppila board reports 30 fps whatever is asked
+#: of it, delivers 78.7, and every fourth of those repeats the third -- so
+#: the copies are dropped (FrameGrabber drop_repeats) and the rate is
+#: measured rather than taken from the board.
+REPEATING_FRAME_USB_IDS = {"04b4:0040"}
+
 #: The camera's baud is a persistent register setting (9600 out of the box;
 #: 38400/115200 selectable and surviving a power cycle), so autodetection
 #: checks all three documented rates rather than only the one requested.
 VISCA_BAUDS = (9600, 38400, 115200)
+
+
+class V4l2Unresponsive(RuntimeError):
+    """v4l2-ctl is installed but did not finish listing the devices."""
+
+
+#: Measured at 5.1 s on an Orin NX with the Oppila board attached (its UVC
+#: control queries fail slowly), against the 5 s this
+#: used to allow -- so every listing timed out with the camera attached.
+V4L2_LIST_TIMEOUT = 20
 
 
 def list_v4l2_devices():
@@ -35,14 +80,24 @@ def list_v4l2_devices():
     UVC camera creates one node per logical stream (capture, metadata, ...)
     under one physical device, and only the card name -- not the node's own
     properties -- says which physical camera a node belongs to.
+
+    Raises V4l2Unresponsive if it is installed but too slow to answer. That
+    is kept apart from "missing" on purpose: missing is what licenses the
+    blind scan in autodetect_video, and a slow listing used to trigger that
+    scan -- which can hand back the wrong camera -- with the real one
+    attached.
     """
     try:
         output = subprocess.run(
             ["v4l2-ctl", "--list-devices"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=V4L2_LIST_TIMEOUT,
         ).stdout
-    except (FileNotFoundError, subprocess.SubprocessError):
+    except FileNotFoundError:
         return None
+    except subprocess.SubprocessError as exc:
+        raise V4l2Unresponsive(
+            f"v4l2-ctl --list-devices did not answer within "
+            f"{V4L2_LIST_TIMEOUT} s") from exc
 
     groups = {}
     card = None
@@ -55,6 +110,98 @@ def list_v4l2_devices():
         elif card is not None and line.strip().startswith("/dev/video"):
             groups[card].append(line.strip())
     return groups
+
+
+def _usb_interface(node):
+    """sysfs directory of the USB interface behind a /dev node, or None."""
+    if not node:
+        return None
+    name = os.path.basename(node)
+    for subsystem in ("video4linux", "tty"):
+        link = Path("/sys/class") / subsystem / name / "device"
+        if link.exists():
+            return link.resolve()
+    return None
+
+
+def usb_id(node):
+    """'vvvv:pppp' of the USB device behind a /dev node, or None if not USB."""
+    interface = _usb_interface(node)
+    if interface is None:
+        return None
+    device = interface.parent
+    try:
+        vendor = (device / "idVendor").read_text().strip()
+        product = (device / "idProduct").read_text().strip()
+    except OSError:
+        return None
+    return f"{vendor}:{product}"
+
+
+def usb_interface_number(node):
+    """bInterfaceNumber of the USB interface behind a /dev node, or None."""
+    interface = _usb_interface(node)
+    try:
+        return int((interface / "bInterfaceNumber").read_text().strip(), 16)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def board_name(card, devices):
+    """Which known camera board a v4l2 card is, or None if it is not one.
+
+    By USB ID first, since that is what identifies the Oppila board behind
+    its generic "FX3 CAMERA" name; by card name for the others.
+    """
+    for device in devices:
+        board = CAMERA_BOARD_USB_IDS.get(usb_id(device))
+        if board:
+            return board
+    if any(hint in card.lower() for hint in FCB_NAME_HINTS):
+        return card
+    return None
+
+
+def camera_serial_ports():
+    """ACM ports belonging to a known camera board, VISCA interface first.
+
+    The Oppila board exposes two ACM ports and only interface 0 carries
+    VISCA, so ordering by interface number finds the camera on the first
+    probe and keeps VISCA bytes off the debug port.
+    """
+    ports = []
+    for p in glob.glob("/dev/ttyACM*"):
+        ident = usb_id(p)
+        if ident not in CAMERA_BOARD_USB_IDS:
+            continue
+        # A board whose VISCA interface is documented is held to it. Probing
+        # the Oppila board's debug port as well only doubled the slow opens
+        # when the board was misbehaving -- each one waits out a USB control
+        # timeout in the kernel -- for a port that never answers VISCA.
+        wanted = VISCA_INTERFACE.get(ident)
+        if wanted is not None and usb_interface_number(p) != wanted:
+            continue
+        ports.append(p)
+    return sorted(ports, key=lambda p: (usb_interface_number(p) or 0, p))
+
+
+def fourcc_of(capture):
+    """The pixel format a capture actually negotiated, e.g. 'YUYV' or 'UYVY'."""
+    code = int(capture.get(cv2.CAP_PROP_FOURCC))
+    return code.to_bytes(4, "little").decode("ascii", "replace").strip("\0 ")
+
+
+def yuv422_to_bgr_code(fourcc):
+    """cvtColor code for raw two-channel 4:2:2 frames in this pixel format.
+
+    Both packings arrive as the same two-channel image once OpenCV stops
+    converting, so the shape cannot tell them apart -- only the negotiated
+    format can. Decoding UYVY as YUYV still yields a picture, just with
+    the colours wrong, which is easy to miss until after a flight.
+    """
+    if fourcc == "UYVY":
+        return cv2.COLOR_YUV2BGR_UYVY
+    return cv2.COLOR_YUV2BGR_YUY2
 
 
 def capture_capable(device):
@@ -95,14 +242,21 @@ def autodetect_video(log=print):
     then times out until it is replugged -- and probing meant opening it
     twice on every startup.
     """
-    groups = list_v4l2_devices()
+    try:
+        groups = list_v4l2_devices()
+    except V4l2Unresponsive as exc:
+        log(f"{exc} -- cannot tell which camera is which, so not guessing. "
+            f"Pass --video to name the device")
+        return None
     if groups is not None:
         for card, devices in groups.items():
-            if not any(hint in card.lower() for hint in FCB_NAME_HINTS):
+            board = board_name(card, devices)
+            if board is None:
                 continue
             for device in devices:
                 if capture_capable(device):
-                    log(f"matched \"{card}\" -> {device}")
+                    label = card if board == card else f"{board}, \"{card}\""
+                    log(f"matched {label} -> {device}")
                     return device
             log(f"matched \"{card}\" but none of its nodes report video "
                 f"capture -- not falling back to an unrelated camera")
@@ -111,8 +265,9 @@ def autodetect_video(log=print):
         # is not attached. Scanning every node from here would just find
         # whatever else is (a laptop's built-in webcam, typically) and hand
         # back the wrong picture, which is worse than no picture.
-        log(f"no /dev/video* device matched a known FCB board name "
-            f"({', '.join(FCB_NAME_HINTS)}) -- is the camera plugged in? "
+        log(f"no /dev/video* device matched a known FCB board "
+            f"(names: {', '.join(FCB_NAME_HINTS)}; NeoHD USB IDs: "
+            f"{', '.join(CAMERA_BOARD_USB_IDS)}) -- is the camera plugged in? "
             f"Pass --video to use one anyway")
         return None
 
@@ -145,19 +300,27 @@ def is_zoom_reply(payload):
     )
 
 
-def answers_visca(port, baud, address=1, timeout=0.3):
+def answers_visca(port, baud, address=1, timeout=None):
     """Whether a real FCB camera is listening on this port and baud.
 
     Asks twice: a stray byte sequence can pass the structural check once,
     but not twice in a row, and a camera always can.
     """
+    if timeout is None:
+        # A board that holds replies back needs padding round trips to get
+        # one out -- measured at 270-650 ms per answer on the Oppila board.
+        timeout = 1.5 if usb_id(port) in CHUNKED_REPLY_USB_IDS else 0.3
     try:
         with ViscaLink(port, baud, address, timeout=timeout) as link:
             for _ in range(2):
                 payload = link.inquiry(visca.zoom_pos_inq(address))
                 if not is_zoom_reply(payload):
                     return False
-                if not 0 <= visca.parse_zoom_pos(payload) <= visca.ZOOM_OPTICAL_TELE_END:
+                # The digital end, not the optical one: the camera drives on
+                # past 30x into digital zoom (neohd-ptz-ros measured it
+                # topping out at exactly 0x7AC0), and a camera left zoomed
+                # in there is still the camera.
+                if not 0 <= visca.parse_zoom_pos(payload) <= visca.ZOOM_DIGITAL_TELE_END:
                     return False
         return True
     except Exception:
@@ -178,7 +341,10 @@ def autodetect_visca(ports=None, bauds=None, address=1):
     looking-but-wrong answer used to leave the camera undetected entirely.
     """
     if ports is None:
-        ports = serial_candidates()
+        # The camera board's own ports first: found on the first probe, and
+        # the autopilot's port is not sent VISCA bytes needlessly.
+        own = camera_serial_ports()
+        ports = own + [p for p in serial_candidates() if p not in own]
     if bauds is None:
         bauds = VISCA_BAUDS
     for port in ports:
@@ -201,14 +367,17 @@ def autodetect_mavlink(bauds=(115200,), exclude=None, timeout=3.0):
     except ImportError:
         return None, None
 
-    candidates = [p for p in serial_candidates() if p != exclude]
+    # Never the camera board's ports: its VISCA port is claimed, and its
+    # debug port is no autopilot -- probing them only costs a timeout each.
+    candidates = [p for p in serial_candidates()
+                  if p != exclude and usb_id(p) not in CAMERA_BOARD_USB_IDS]
     for candidate in candidates:
         for baud in bauds:
             connection = None
             try:
                 connection = mavutil.mavlink_connection(candidate, baud=baud)
                 if connection.wait_heartbeat(timeout=timeout):
-                    return candidate, baud
+                    return stable_serial_path(candidate), baud
             except Exception:
                 pass
             finally:
@@ -218,6 +387,26 @@ def autodetect_mavlink(bauds=(115200,), exclude=None, timeout=3.0):
                     except Exception:
                         pass
     return None, None
+
+
+def stable_serial_path(node):
+    """A name for a serial device that survives it being replugged.
+
+    /dev/ttyACM numbers are handed out in plug order, so an autopilot
+    unplugged and replugged mid-session -- or one that resets -- can come
+    back as a different ttyACM, and a link that keeps reconnecting to the
+    old name never sees it again. The /dev/serial/by-id link is built from
+    the USB device's own identity and follows it. Falls back to the node
+    itself where there is no such link (the Jetson's UARTs, a pty).
+    """
+    try:
+        target = os.path.realpath(node)
+        for link in sorted(glob.glob("/dev/serial/by-id/*")):
+            if os.path.realpath(link) == target:
+                return link
+    except OSError:
+        pass
+    return node
 
 
 def serial_candidates():
@@ -250,3 +439,47 @@ def open_capture(device, width=1920, height=1080, fourcc=None):
     capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     capture.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     return capture
+
+
+def describe_camera():
+    """(exit status, lines) naming the attached camera board and its nodes.
+
+    For scripts that need to say which board they found without opening
+    the video or the VISCA port -- the recorder may already hold both, and
+    this board wedges after enough open/release churn.
+    """
+    try:
+        groups = list_v4l2_devices()
+    except V4l2Unresponsive as exc:
+        return 2, [f"{exc}, so the camera board cannot be identified"]
+    if groups is None:
+        return 2, ["v4l2-ctl is not installed, so the camera board cannot "
+                   "be identified (sudo apt install v4l-utils)"]
+    for card, nodes in groups.items():
+        board = board_name(card, nodes)
+        if board is None:
+            continue
+        ident = next(filter(None, map(usb_id, nodes)), None)
+        video = next((n for n in nodes if capture_capable(n)), None)
+        line = board if board == card else f"{board} (\"{card}\")"
+        if ident:
+            line += f" [{ident}]"
+        line += f", video {video or 'none that can capture'}"
+        lines = [line]
+        if ident in CAMERA_BOARD_USB_IDS:
+            control = camera_serial_ports()
+            lines[0] += f", control {control[0] if control else 'not found'}"
+        if ident == "04b4:00f8":
+            # Raw 1080p 4:2:2 needs about 1 Gbit/s; USB 2 carries 480 Mbit/s.
+            lines.append("is on a USB 2 link, which cannot carry its 1080p "
+                         "video -- expect no frames, though zoom and IR "
+                         "control still work. Use a USB 3 port and cable, "
+                         "and a powered hub if it goes through one")
+        return 0, lines
+    return 1, ["no known camera board is attached"]
+
+
+if __name__ == "__main__":
+    status, lines = describe_camera()
+    print("\n".join(lines))
+    sys.exit(status)

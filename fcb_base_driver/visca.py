@@ -162,6 +162,25 @@ def image_stabilizer(on: bool, address: int = 1) -> bytes:
     return bytes([header(address), 0x01, 0x04, 0x34, 0x02 if on else 0x03, 0xFF])
 
 
+def stabilizer_inq(address: int = 1) -> bytes:
+    """CAM_StabilizerModeInq: 8x 09 04 34 FF -> y0 50 02 (on) | 03 (off) FF"""
+    return bytes([header(address), 0x09, 0x04, 0x34, 0xFF])
+
+
+#: CAM_StabilizerModeInq reply byte -> state. 0x00 is the manual's "Hold".
+STABILIZER_STATES = {0x02: "on", 0x03: "off", 0x00: "hold"}
+
+
+def parse_stabilizer(payload: bytes) -> str:
+    """Decode a CAM_StabilizerModeInq completion payload: on, off or hold."""
+    if len(payload) < 2:
+        raise ValueError(f"payload too short for a stabilizer state: {payload.hex()}")
+    try:
+        return STABILIZER_STATES[payload[1]]
+    except KeyError:
+        raise ValueError(f"unrecognised stabilizer byte: 0x{payload[1]:02X}") from None
+
+
 # --- IR cut filter (ICR) / day-night ----------------------------------
 #
 # The FCB-EV9520L is a single visible-light sensor with a mechanically
